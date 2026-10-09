@@ -478,12 +478,26 @@ _JS_EXTRACT_CARDS = r"""
     }
     const RATING_ROW = /^\d[\d.,]*\s*\(/;   // "4.8(204)"
     const NO_REVIEWS = /^no reviews$/i;      // unreviewed listings show this where the rating goes
+    const BARE_RATING = /^\d(?:[.,]\d)?$/;  // "4.9" on a line of its own
+    const BARE_REVIEWS = /^\(([\d,.]+)\s*([kKmM]?)\)$/;  // "(23)" on a line of its own
+    const takeReviews = (t) => {
+      const m = t.match(/\(([\d,.]+)\s*([kKmM]?)\)/);
+      if (!m || review_count !== null) return;
+      let n = parseFloat(m[1].replace(/,/g, ''));
+      if (/k/i.test(m[2])) n *= 1000;
+      if (/m/i.test(m[2])) n *= 1e6;
+      if (!Number.isNaN(n)) review_count = Math.round(n);
+    };
     for (const row of rows) {
       const parts = row.split('·').map(s => s.trim()).filter(Boolean);
-      if (parts.length && NO_REVIEWS.test(parts[0])) {
-        if (review_count === null) review_count = 0;
-        parts.shift();
+      // Rating / review-count pieces that stand alone are not the category.
+      while (parts.length && (NO_REVIEWS.test(parts[0]) || BARE_RATING.test(parts[0]) || BARE_REVIEWS.test(parts[0]))) {
+        const p = parts.shift();
+        if (NO_REVIEWS.test(p)) { if (review_count === null) review_count = 0; }
+        else if (BARE_RATING.test(p)) { if (rating === null) rating = parseFloat(p.replace(',', '.')); }
+        else takeReviews(p);
       }
+      if (parts.length && RATING_ROW.test(parts[0])) takeReviews(parts[0]);
       if (!parts.length || STATUS.test(parts[0]) || PHONE.test(parts[0]) || RATING_ROW.test(parts[0])) continue;
       category_label = parts[0];
       // Service-area businesses show no address: the row is the category alone.

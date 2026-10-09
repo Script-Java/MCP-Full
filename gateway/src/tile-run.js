@@ -34,6 +34,10 @@ const QUADS = ['NW', 'NE', 'SW', 'SE'];
 // Maps caps a feed at ~120; after de-duplication a capped feed often shows 116-119 cards,
 // so (as in the reference) 115+ counts as capped even when harvest_tile's saturated is false.
 const CAP_THRESHOLD = 115;
+// Maps search text. The bare category mixes in results near the server's own location (San Jose
+// from Railway); "near <Town> TX" makes Maps re-centre on the town and ignore the viewport, so
+// sub-areas repeat each other. "<category> Texas" keeps both the state and the viewport (live test).
+const searchText = (category) => `${category} Texas`;
 const ROOT_ZOOM = 13;
 // Capped sub-areas are split again down to this zoom (13 centre, 14 quadrants, 15, ...).
 const MAX_ZOOM = Math.min(Math.max(Number(process.env.TILE_RUN_MAX_ZOOM || 15), 14), 17);
@@ -470,7 +474,7 @@ async function runLoop(rec) {
         const next = { subArea, ...(await coordsOf(subArea)) };
         const ctx = { city, category, ...next };
         const res = await callJson(deps.harvest, 'harvest_tile',
-          { category, lat: next.lat, lng: next.lng, zoom: next.zoom, limit: 120, extended: true });
+          { category: searchText(category), lat: next.lat, lng: next.lng, zoom: next.zoom, limit: 120, extended: true });
         totals.searches++;
         if (res.selector_version) rec.selectorVersion = res.selector_version;
         if (res.error || !Array.isArray(res.results)) {

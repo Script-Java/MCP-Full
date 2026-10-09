@@ -220,7 +220,7 @@ for (let i = 0; i < 200 && !(s1 = JSON.parse(T.tileRunStatus({ run_id: first.run
 assert.deepEqual([s1.status, s1.searches, s1.inserted, s1.duplicates, s1.harvest_run_id], ['challenged', 6, 6, 1, 7]);
 assert.match(s1.stop_reason, /^challenge_detected on roofing contractor Aubrey, TX center/);
 const tileArgs = harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => a);
-assert.deepEqual(tileArgs[0], { category: 'hvac contractor', lat: 33.3, lng: -96.95, zoom: 13, limit: 120, extended: true });
+assert.deepEqual(tileArgs[0], { category: 'hvac contractor Texas', lat: 33.3, lng: -96.95, zoom: 13, limit: 120, extended: true });
 assert.deepEqual(tileArgs.slice(1, 5).map((a) => [a.zoom, Math.sign(a.lat - 33.3), Math.sign(a.lng + 96.95)]), [[14, 1, -1], [14, 1, 1], [14, -1, -1], [14, -1, 1]]);
 const searchLogInserts = db.queries.filter((q) => q.startsWith('insert into search_log'));
 assert.equal(searchLogInserts.length, 5);
@@ -282,7 +282,7 @@ assert.deepEqual([s4.dry_run, s4.status, s4.searches, s4.inserted, s4.harvest_ru
 assert.deepEqual(db.queries.filter((q) => /^(insert|update|delete)/i.test(q)), [], 'a dry run must not write');
 assert.equal(fetched.length, 1, 'geocoded once per run');
 assert.match(fetched[0], /q=Pilot%20Point%2C%20Texas/);
-assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => [a.category, a.lat, a.lng]), [['plumber', 33.3, -96.95], ['hvac contractor', 33.3, -96.95]]);
+assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => [a.category, a.lat, a.lng]), [['plumber Texas', 33.3, -96.95], ['hvac contractor Texas', 33.3, -96.95]]);
 
 // Run 5: a 116-card centre counts as capped even with saturated=false (reference CAP_THRESHOLD 115).
 db.towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95, skip: false }];
