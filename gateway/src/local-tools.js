@@ -139,6 +139,9 @@ export function startLeadRun(args) {
   return text({ started: true, run_id: id, trade, offset, limit, expected_minutes: Math.ceil((limit * 20) / 60) });
 }
 
+/** True while a start_lead_run child is going (tile runs wait for it: same browser and budget). */
+export const leadRunActive = () => Boolean(current && current.exitCode === undefined);
+
 /** Pure: summarise a lead-run log. */
 export function summariseLog(logText) {
   const lines = logText.split('\n').filter(Boolean);

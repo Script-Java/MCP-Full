@@ -186,6 +186,8 @@ export function buildServerCatalog(env = process.env) {
     args: [`${root}/harvest/server.py`],
     env: {
       HARVEST_HEADLESS: '1',
+      // Written by the gateway from the active_selectors table (src/tile-run.js).
+      HARVEST_SELECTORS_FILE: `${dataDir}/harvest/active-selectors.json`,
       XDG_CACHE_HOME: env.MCP_CAMOUFOX_CACHE || '/opt/camoufox-cache',
       ...(env.HARVEST_PROXY ? { HARVEST_PROXY: env.HARVEST_PROXY } : {}),
       ...(env.HARVEST_MAX_CALLS ? { HARVEST_MAX_CALLS: env.HARVEST_MAX_CALLS } : {}),

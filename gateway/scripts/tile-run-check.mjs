@@ -1,0 +1,205 @@
+// Offline self-check for src/tile-run.js: node scripts/tile-run-check.mjs
+// Pure helpers, then whole runs against fake harvest/supabase upstreams (no network, no database).
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tile-run-'));
+process.env.MCP_DATA_DIR = tmp;
+process.env.TILE_RUN_MIN_DELAY_MS = '0';
+process.env.TILE_RUN_MAX_DELAY_MS = '0';
+delete process.env.TILE_RUN_CRON;
+const T = await import('../src/tile-run.js');
+
+// ---- CID conversion, normalisation, SQL literals ----
+assert.equal(T.cidToDecimal('15206450886171335178'), '15206450886171335178');
+assert.equal(T.cidToDecimal('0x1a2b'), '6699');
+assert.equal(T.cidToDecimal(null, 'https://www.google.com/maps?cid=123456'), '123456');
+assert.equal(T.cidToDecimal(null, 'https://www.google.com/maps/place/X/data=!4m7!3m6!1s0x864c3c:0xd3071d5d0a7c2c0a!8m2'), BigInt('0xd3071d5d0a7c2c0a').toString());
+assert.equal(T.cidToDecimal(null, 'https://www.google.com/maps/place/X'), null);
+assert.deepEqual(T.coordsFromUrl('https://www.google.com/maps/place/X/data=!3d33.2523966!4d-97.1083496!16s'), { lat: 33.2523966, lng: -97.1083496 });
+assert.equal(T.nameNorm("Joe's Plumbing, LLC"), 'joe s plumbing');
+assert.equal(T.phone10('+1 (214) 555-0101'), '2145550101');
+assert.equal(T.phone10('555-0101'), null);
+assert.equal(T.lit("O'Brien\0 Co"), "'O''Brien Co'");
+assert.equal(T.lit(''), 'NULL');
+assert.equal(T.lit(4.5), "'4.5'");
+assert.equal(T.lit(NaN), 'NULL');
+
+// ---- filters ----
+const card = (o) => ({ name: 'Good Plumbing', maps_cid: '111', maps_url: 'https://www.google.com/maps?cid=111', rating: 4.8, review_count: 12,
+  has_website: false, website_url: null, sponsored: false, address_line: '1 Main St', phone: '(214) 555-0101', category_label: 'Plumber',
+  lat: 33.3, lng: -96.95, closed: false, ...o });
+const spam = [{ lat: 33.2523966, lng: -97.1083496 }];
+const f = T.filterCards([
+  card({}),
+  card({ name: 'Has Site', has_website: true, website_url: 'https://hassite.com/', phone: '2145550102' }),
+  card({ name: 'Social', maps_cid: '222', has_website: true, website_url: 'https://www.facebook.com/socialco?ref=x', phone: '2145550103' }),
+  card({ name: 'Linktree', maps_cid: '223', has_website: true, website_url: 'https://linktr.ee/x', phone: '2145550104' }),
+  card({ name: 'Ad', maps_cid: '333', sponsored: true, phone: '2145550105' }),
+  card({ name: 'Closed', maps_cid: '444', closed: true, phone: '2145550106' }),
+  card({ name: 'No contact', maps_cid: '555', phone: null, address_line: null }),
+  card({ name: 'No cid', maps_cid: null, maps_url: 'https://www.google.com/maps/place/x', phone: '2145550107' }),
+  card({ name: 'Oklahoma', maps_cid: '666', lat: 36.9, lng: -97.0, phone: '2145550108' }),
+  card({ name: 'Spam pin', maps_cid: '777', lat: 33.2525, lng: -97.1081, phone: '2145550109' }),
+  card({ name: 'Same phone', maps_cid: '888' }),
+  card({ name: 'No phone', maps_cid: '0x3e7', phone: null, lat: null, lng: null }),
+], spam);
+assert.deepEqual(f.cand.map((c) => c.name), ['Good Plumbing', 'Social', 'Linktree', 'No phone']);
+assert.deepEqual({ ...f.stats }, { seen: 12, inserted: 0, dupes: 1, outOfArea: 2, closed: 1, incomplete: 2, websites: 1 });
+assert.equal(f.cand[1].social, true);
+assert.equal(f.cand[1].webHref, 'https://www.facebook.com/socialco');
+assert.equal(f.cand[3].sourceId, '999');
+assert.equal(f.cand[3].p10, null);
+
+// ---- insert SQL ----
+const [ins] = T.buildInserts([f.cand[0], f.cand[1]], { city: 'Aubrey, TX', category: 'plumber', lat: 33.3, lng: -96.95, zoom: 13 }, '2026-09-14.1');
+assert.match(ins, /^insert into public\."no-Website-lead" \(name,category,address,phone,city,rating,review_count,google_maps_url,source_id,zip,name_norm,phone_e164,website_class,social_or_notes,found_on,state,selector_version\) values /);
+assert.match(ins, /'Good Plumbing','Plumber','1 Main St','\(214\) 555-0101','Aubrey, TX','4.8','12','https:\/\/www\.google\.com\/maps\?cid=111','111',NULL,'good plumbing','\+12145550101','none',NULL,'plumber @33\.3,-96\.95,13z','harvested','2026-09-14\.1'\)/);
+assert.match(ins, /'social_only','https:\/\/www\.facebook\.com\/socialco'/);
+assert.match(ins, /on conflict \(source_id\) do nothing returning source_id$/);
+assert.equal(T.buildInserts(Array(120).fill(f.cand[0]), { city: 'X', category: 'c', lat: 1, lng: 2, zoom: 13 }, 'v').length, 3); // 50 per statement
+
+// ---- work picking / resume ----
+const towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95 }, { city: 'Denton', priority: 90, lat: null, lng: null }];
+let w = T.planWork([], towns, new Set());
+assert.deepEqual([w.city, w.category, [...w.already]], ['Aubrey', 'plumber', []]);
+const logRows = [
+  { city: 'Aubrey, TX', category: 'plumber', status: 'done', sub_area: 'center' },
+  { city: 'Aubrey, TX', category: 'hvac contractor', status: 'partial', sub_area: 'center' },
+  { city: 'Aubrey, TX', category: 'hvac contractor', status: 'partial', sub_area: 'NW' },
+];
+w = T.planWork(logRows, towns, new Set());
+assert.deepEqual([w.city, w.category, [...w.already].sort()], ['Aubrey, TX', 'hvac contractor', ['NW', 'center']]);
+w = T.planWork([...logRows, { city: 'Aubrey, TX', category: 'roofing contractor', status: 'partial', sub_area: 'reopened' }], towns, new Set(['aubrey|hvac contractor']));
+assert.deepEqual([w.category, w.already.size], ['roofing contractor', 0]);
+const allAubrey = new Set(T.CATEGORIES.map((c) => `aubrey|${c}`));
+assert.equal(T.planWork([], towns, allAubrey).town.city, 'Denton');
+assert.equal(T.CATEGORIES.length, 24);
+
+// ---- cron (America/Chicago) ----
+const every3h = T.parseCron('0 */3 * * *');
+assert.equal(T.cronMatches(every3h, new Date('2026-10-09T14:00:00Z')), true);  // 09:00 CDT
+assert.equal(T.cronMatches(every3h, new Date('2026-10-09T15:00:00Z')), false); // 10:00 CDT
+assert.equal(T.cronMatches(every3h, new Date('2026-12-01T15:00:00Z')), true);  // 09:00 CST
+assert.equal(T.cronMatches(every3h, new Date('2026-10-09T14:01:00Z')), false);
+const firstOrMonday = T.parseCron('30 9 1 * 1');
+assert.equal(T.cronMatches(firstOrMonday, new Date('2026-10-12T14:30:00Z')), true);  // Monday 12 Oct
+assert.equal(T.cronMatches(firstOrMonday, new Date('2026-10-01T14:30:00Z')), true);  // the 1st (a Thursday)
+assert.equal(T.cronMatches(firstOrMonday, new Date('2026-10-13T14:30:00Z')), false);
+assert.throws(() => T.parseCron('0 */3 * *'));
+assert.throws(() => T.parseCron('61 * * * *'));
+
+// ---- whole runs against fakes ----
+const db = {
+  towns: [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95, skip: false }],
+  log: [{ city: 'Aubrey, TX', category: 'plumber', status: 'done', sub_area: 'center' }],
+  existingPhones: ['2145550199'],
+  queries: [],
+  nextId: 100,
+};
+const rowsFor = (q) => {
+  db.queries.push(q);
+  if (/^insert into harvest_runs/.test(q)) return [{ id: 7 }];
+  if (/from active_selectors/.test(q)) return [{ version: '2026-09-14.1', selectors: { feed: 'div[role="feed"]', website_btn: 'a[data-value="Website"]' } }];
+  if (/from spam_coords/.test(q)) return spam;
+  if (/from search_log$/.test(q)) return db.log;
+  if (/from harvest_towns/.test(q)) return db.towns;
+  if (/^insert into search_log/.test(q)) return [{ id: db.nextId++ }];
+  if (/ as p10 from /.test(q)) return db.existingPhones.filter((p) => q.includes(`'${p}'`)).map((p10) => ({ p10 }));
+  if (/^select name_norm from/.test(q)) return [];
+  if (/^insert into public\."no-Website-lead"/.test(q)) return (q.match(/'harvested'/g) ?? []).map((_, i) => ({ source_id: String(i) }));
+  if (/^update /.test(q)) return [];
+  throw new Error(`unexpected sql: ${q.slice(0, 80)}`);
+};
+const reply = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }] });
+const supabase = {
+  callTool: async (name, { query }) => {
+    assert.equal(name, 'execute_sql');
+    const rows = rowsFor(query.trim());
+    return reply({ result: `Below is the result of the SQL query. Use the data within the <untrusted-data-ab12> boundaries.\n\n<untrusted-data-ab12>\n${JSON.stringify(rows)}\n</untrusted-data-ab12>\n` });
+  },
+};
+const harvestCalls = [];
+let tiles = [];
+const harvest = {
+  callTool: async (name, args) => {
+    harvestCalls.push([name, args]);
+    if (name === 'subdivide_tile') {
+      return reply({ children: [[1, -1], [1, 1], [-1, -1], [-1, 1]].map(([dy, dx]) => ({ lat: args.lat + dy * 0.0324, lng: args.lng + dx * 0.0549, zoom: 14 })) });
+    }
+    assert.equal(name, 'harvest_tile');
+    return reply(tiles.shift() ?? { error: 'internal' });
+  },
+};
+const logs = [];
+T.initTileRuns({ harvest, supabase, log: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) } });
+
+const runToEnd = async (max) => {
+  const started = JSON.parse(T.startTileRun({ max_searches: max }).content[0].text);
+  assert.equal(started.started, true);
+  for (let i = 0; i < 200; i++) {
+    const s = JSON.parse(T.tileRunStatus({}).content[0].text);
+    if (!s.running) return s;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error('run did not finish');
+};
+const sv = '2026-09-14.1';
+const quiet = (n, name) => ({ selector_version: sv, saturated: false, results: [card({ name, maps_cid: String(900 + n), phone: `21455501${10 + n}` }), card({ name: `${name} site`, has_website: true, website_url: 'https://x.com', maps_cid: '1' })] });
+
+// Run 1: saturated centre -> four children -> next category challenged.
+tiles = [
+  { selector_version: sv, saturated: true, results: [
+    card({}), card({ name: 'Has Site', has_website: true, website_url: 'https://hassite.com/' }),
+    card({ name: 'Known', maps_cid: '5', phone: '214-555-0199' }), card({ name: 'Social', maps_cid: '222', has_website: true, website_url: 'https://instagram.com/s', phone: '2145550103' }),
+  ] },
+  quiet(1, 'NW Co'), quiet(2, 'NE Co'), quiet(3, 'SW Co'), quiet(4, 'SE Co'),
+  { error: 'challenge_detected', retry_after_s: 900, selector_version: sv },
+];
+assert.equal(T.startTileRun({ max_searches: 0 }).isError, true);
+const first = JSON.parse(T.startTileRun({ max_searches: 10 }).content[0].text);
+assert.equal(T.startTileRun({}).isError, true, 'second concurrent run must be refused');
+let s1;
+for (let i = 0; i < 200 && !(s1 = JSON.parse(T.tileRunStatus({ run_id: first.run_id }).content[0].text), !s1.running); i++) await new Promise((r) => setTimeout(r, 10));
+assert.deepEqual([s1.status, s1.searches, s1.inserted, s1.duplicates, s1.harvest_run_id], ['challenged', 6, 6, 1, 7]);
+assert.match(s1.stop_reason, /^challenge_detected on roofing contractor Aubrey, TX center/);
+const tileArgs = harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => a);
+assert.deepEqual(tileArgs[0], { category: 'hvac contractor', lat: 33.3, lng: -96.95, zoom: 13, limit: 120, extended: true });
+assert.deepEqual(tileArgs.slice(1, 5).map((a) => [a.zoom, Math.sign(a.lat - 33.3), Math.sign(a.lng + 96.95)]), [[14, 1, -1], [14, 1, 1], [14, -1, -1], [14, -1, 1]]);
+const searchLogInserts = db.queries.filter((q) => q.startsWith('insert into search_log'));
+assert.equal(searchLogInserts.length, 5);
+assert.match(searchLogInserts[0], /'Aubrey, TX','hvac contractor','center','13','4','2','1','0','partial','server; capped at 4 — next sub-area NW'/);
+assert.match(searchLogInserts[1], /'NW','14',.*'partial','server; NW done — next sub-area NE'/);
+assert.match(searchLogInserts[4], /'SE','14',.*'done','server; closed 0, incomplete 0'/);
+const leadInserts = db.queries.filter((q) => q.startsWith('insert into public."no-Website-lead"'));
+assert.match(leadInserts[0], /'hvac contractor @33\.3,-96\.95,13z','harvested','2026-09-14\.1'/);
+assert.match(leadInserts[0], /'social_only','https:\/\/instagram\.com\/s'/);
+assert.ok(!leadInserts.some((q) => q.includes("'Known'")), 'phone already in the table must not be inserted');
+const runRow = db.queries.find((q) => q.startsWith('insert into harvest_runs'));
+assert.match(runRow, /values \('server', 'server; /);
+assert.match(db.queries.findLast((q) => q.startsWith('update harvest_runs')), /status='challenged'.*searches=6, cards_seen=12, inserted=6, duplicates=1, out_of_area=0 where id=7/s);
+const selFile = JSON.parse(fs.readFileSync(T.SELECTORS_FILE, 'utf8'));
+assert.equal(selFile.version, '2026-09-14.1');
+
+// Run 2: two categories with 10+ cards and no website button -> selector_broken, nothing inserted, both reopened.
+const noWeb = { selector_version: sv, saturated: false, results: Array.from({ length: 12 }, (_, i) => card({ name: `N${i}`, maps_cid: String(i + 10), phone: `21455502${10 + i}` })) };
+tiles = [noWeb, noWeb];
+db.queries.length = 0;
+const s2 = await runToEnd(10);
+assert.deepEqual([s2.status, s2.searches, s2.inserted], ['selector_broken', 2, 0]);
+assert.ok(!db.queries.some((q) => q.startsWith('insert into public."no-Website-lead"')));
+assert.match(db.queries.find((q) => q.startsWith('update search_log')), /set status='partial', sub_area='reopened'.* where id in \(\d+,\d+\)$/s);
+assert.deepEqual(db.queries.filter((q) => q.startsWith('insert into search_log')).map((q) => q.match(/'(hvac contractor|roofing contractor)'/)[1]), ['hvac contractor', 'roofing contractor']);
+
+// Run 3: selectors_stale stops at once; nothing logged for that search.
+tiles = [{ error: 'selectors_stale', hint: 'results feed not found', selector_version: sv }];
+db.queries.length = 0;
+const s3 = await runToEnd(10);
+assert.deepEqual([s3.status, s3.searches], ['selector_broken', 1]);
+assert.ok(!db.queries.some((q) => q.startsWith('insert into search_log')));
+
+await T.stopTileRuns('test over');
+fs.rmSync(tmp, { recursive: true, force: true });
+console.log('tile-run ok');

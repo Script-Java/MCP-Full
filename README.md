@@ -19,11 +19,36 @@ Upstreams (see `gateway/src/servers.js`): supabase, github, playwright,
 filesystem, memory, sequentialthinking, fetch, git, duckduckgo, harvest, time,
 plus the optional `everything` test server.
 
+## Server-side Maps harvest (tile runs)
+
+`gateway__start_tile_run {max_searches}` runs the Google Maps harvest from
+`docs/harvester-reference.mjs` inside the gateway with no agent: towns from
+`harvest_towns` x 24 categories, resumed from `search_log`, `harvest_tile` at
+13z (four `subdivide_tile` children when saturated), new no-website leads into
+`"no-Website-lead"`, one `harvest_runs` row per run (`runner = 'server'`).
+`gateway__tile_run_status` reports progress; logs go to `/data/tile-runs/`.
+Set `TILE_RUN_CRON` (America/Chicago) to run it on a schedule. Tables:
+`docs/migrations.sql`.
+
+Every 5 minutes the gateway copies the `active_selectors` row to
+`/data/harvest/active-selectors.json`; the harvest server applies it over its
+built-in selectors (`website_btn` maps to `card_website`, `rating` is ignored)
+and falls back to the built-ins if it is missing or invalid.
+
+## Tests
+
+```sh
+node gateway/scripts/local-tools-check.mjs
+node gateway/scripts/tile-run-check.mjs
+python harvest/test_presence.py && python harvest/test_selectors.py && python harvest/test_licenses.py
+```
+
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `gateway/` | Node gateway: HTTP server, session handling, upstream supervisor |
+| `gateway/` | Node gateway: HTTP server, session handling, upstream supervisor, tile runs |
+| `docs/` | Reference harvester and Supabase migrations (not deployed) |
 | `harvest/` | Python MCP server for lead harvesting (Camoufox, licence rosters, Google Maps) |
 | `entrypoint.sh` | Fixes `/data` volume ownership, then drops to the `node` user |
 | `Dockerfile` | Builds the whole image |

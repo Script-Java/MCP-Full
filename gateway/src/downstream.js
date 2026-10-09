@@ -16,6 +16,7 @@ import {
   ASYNC_AFTER_MS, JOB_TOOL, RUN_STATUS_TOOL, START_RUN_TOOL,
   jobResult, leadRunStatus, startLeadRun, withEarlyReturn,
 } from './local-tools.js';
+import { START_TILE_RUN_TOOL, TILE_RUN_STATUS_TOOL, startTileRun, tileRunStatus } from './tile-run.js';
 
 const SEP = '__';
 // Cap on the text a single tool result may carry back to the client. Page
@@ -71,13 +72,15 @@ export function createDownstreamServer(upstreams, opts) {
 
   const qualify = (up, name) => (aggregate ? `${up.name}${SEP}${name}` : name);
 
-  // Gateway-native tools: job_result everywhere; lead runs on /mcp and /harvest/mcp.
+  // Gateway-native tools: job_result everywhere; lead and tile runs on /mcp and /harvest/mcp.
   const LOCAL = 'gateway';
   const localName = (name) => (aggregate ? `${LOCAL}${SEP}${name}` : name);
   const local = new Map([[JOB_TOOL.name, [JOB_TOOL, jobResult]]]);
   if (aggregate || upstreams[0]?.name === 'harvest') {
     local.set(START_RUN_TOOL.name, [START_RUN_TOOL, startLeadRun]);
     local.set(RUN_STATUS_TOOL.name, [RUN_STATUS_TOOL, leadRunStatus]);
+    local.set(START_TILE_RUN_TOOL.name, [START_TILE_RUN_TOOL, (a) => startTileRun(a)]);
+    local.set(TILE_RUN_STATUS_TOOL.name, [TILE_RUN_STATUS_TOOL, tileRunStatus]);
   }
   const localTool = (qualified) => {
     if (!aggregate) return local.get(qualified);

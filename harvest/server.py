@@ -62,7 +62,7 @@ mcp = MCPServer("maps-harvest", lifespan=_lifespan)
 
 
 @mcp.tool(structured_output=False)
-async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: int = 50) -> str:
+async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: int = 50, extended: bool = False) -> str:
     """Harvest every business card from one Google Maps search viewport.
 
     Loads the Maps search for `category` (e.g. "plumber") centred on
@@ -78,14 +78,15 @@ async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: 
     `saturated: true` means the feed hit Google's ~120-result cap; call
     `subdivide_tile` and harvest the four children. `truncated: true` means
     `limit` was reached before the end of the feed. `limit` defaults to 50
-    and is capped at 120 server-side.
+    and is capped at 120 server-side. extended=true adds lat, lng (the pin,
+    null if unknown) and closed (permanently/temporarily closed) per card.
 
     Errors: {"error": "challenge_detected"} (stop; retry_after_s given),
     {"error": "selectors_stale"}, {"error": "timeout"} (may carry
     partial_results), {"error": "circuit_open"}, {"error": "budget_exhausted"},
     {"error": "invalid_argument"}.
     """
-    return _compact(await maps_harvest.harvest_tile(category, lat, lng, zoom, limit))
+    return _compact(await maps_harvest.harvest_tile(category, lat, lng, zoom, limit, extended))
 
 
 @mcp.tool(structured_output=False)

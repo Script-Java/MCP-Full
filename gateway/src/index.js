@@ -21,6 +21,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { buildServerCatalog } from './servers.js';
 import { Upstream } from './upstream.js';
 import { createDownstreamServer } from './downstream.js';
+import { initTileRuns, stopTileRuns } from './tile-run.js';
 
 const VERSION = '1.1.0';
 const PORT = Number(process.env.PORT || 8080);
@@ -74,6 +75,8 @@ if (!TOKEN) {
 await Promise.allSettled(upstreams.map((u) => u.connect()));
 // Warm tool caches so /health can report counts.
 await Promise.allSettled(upstreams.filter((u) => u.status === 'up').map((u) => u.listTools()));
+// Server-side Maps tile runs (start_tile_run, TILE_RUN_CRON, active_selectors copy).
+initTileRuns({ harvest: byName.get('harvest'), supabase: byName.get('supabase'), log });
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -435,6 +438,7 @@ async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   log.info(`${signal} received, draining (${inflight} in flight, ${sessions.size} sessions)`);
+  await stopTileRuns(`server shutdown (${signal})`);
   server.close();
   server.closeIdleConnections?.();
   const deadline = Date.now() + DRAIN_MS;

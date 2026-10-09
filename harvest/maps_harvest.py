@@ -30,6 +30,7 @@ import asyncio
 import functools
 import html
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -137,6 +138,104 @@ CONFIG: dict[str, Any] = {
 }
 
 _ALLOWED_MAPS_HOSTS = {"www.google.com", "google.com", "maps.google.com", "maps.app.goo.gl"}
+
+# ---------------------------------------------------------------------------
+# Live selectors. The gateway copies the active_selectors table (the
+# Mechanic's fixes) to HARVEST_SELECTORS_FILE as {"version", "selectors"};
+# this process holds no database credentials, so it only reads that file.
+# The table uses the script harvester's key names: website_btn maps onto
+# card_website; rating is ignored (it names a different element there).
+# Anything invalid falls back to the built-in SELECTORS above.
+# ---------------------------------------------------------------------------
+_BUILTIN_SELECTORS = dict(SELECTORS)
+_BUILTIN_VERSION = SELECTOR_VERSION
+SELECTORS_FILE = os.environ.get("HARVEST_SELECTORS_FILE", "")
+_TABLE_KEY_MAP = {"website_btn": "card_website"}
+_TABLE_KEY_IGNORED = {"rating"}
+_REGEX_KEYS = {k for k in _BUILTIN_SELECTORS if k.endswith("_text")} | {"challenge_url"}
+_PLAIN_KEYS = {"consent_host"}
+# file mtime last looked at; whether the table set passed the in-page check; versions that failed it
+_live = {"mtime": None, "source": "builtin", "checked": True, "rejected": set()}
+
+
+def merge_selectors(table: Any) -> dict[str, str]:
+    """Built-in selectors overlaid with an active_selectors row. Raises ValueError if any value is unusable."""
+    if not isinstance(table, dict):
+        raise ValueError("selectors must be an object")
+    merged = dict(_BUILTIN_SELECTORS)
+    for key, value in table.items():
+        if key in _TABLE_KEY_IGNORED:
+            continue
+        name = _TABLE_KEY_MAP.get(key, key)
+        if name not in _BUILTIN_SELECTORS:
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > 500 or re.search(r"[\x00-\x1f]", value):
+            raise ValueError(f"bad value for {key}")
+        if name in _REGEX_KEYS:
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError(f"bad regex for {key}: {exc}") from None
+        merged[name] = value
+    return merged
+
+
+def _use_builtin() -> None:
+    global SELECTORS, SELECTOR_VERSION
+    SELECTORS, SELECTOR_VERSION = dict(_BUILTIN_SELECTORS), _BUILTIN_VERSION
+    _live.update(source="builtin", checked=True)
+
+
+def refresh_selectors() -> None:
+    """Re-read SELECTORS_FILE if it changed since the last call (one stat per call)."""
+    global SELECTORS, SELECTOR_VERSION
+    if not SELECTORS_FILE:
+        return
+    try:
+        mtime = os.stat(SELECTORS_FILE).st_mtime_ns
+    except OSError:
+        mtime = None
+    if mtime == _live["mtime"]:
+        return
+    _live["mtime"] = mtime
+    if mtime is None:
+        _use_builtin()
+        return
+    try:
+        with open(SELECTORS_FILE, encoding="utf-8") as fh:
+            row = json.load(fh)
+        version = str(row.get("version") or "").strip()
+        if not version or len(version) > 64:
+            raise ValueError("missing version")
+        if version in _live["rejected"]:
+            raise ValueError(f"version {version} failed the in-page check")
+        merged = merge_selectors(row.get("selectors"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("active selectors not used (%s); using built-in %s", exc, _BUILTIN_VERSION)
+        _use_builtin()
+        return
+    SELECTORS, SELECTOR_VERSION = merged, version
+    _live.update(source="table", checked=False)
+    log.info("selectors %s loaded from %s", version, SELECTORS_FILE)
+
+
+_JS_BAD_SELECTORS = r"""
+(S) => Object.keys(S).filter((k) => { try { document.querySelector(S[k]); return false; } catch (e) { return true; } })
+"""
+
+
+async def _check_live_selectors(page) -> None:
+    """First use of a table selector set: reject it if any CSS selector doesn't parse."""
+    if _live["checked"]:
+        return
+    css = {k: v for k, v in SELECTORS.items() if k not in _REGEX_KEYS and k not in _PLAIN_KEYS}
+    bad = await page.evaluate(_JS_BAD_SELECTORS, css)
+    if bad:
+        log.warning("selectors %s rejected, invalid CSS for %s; using built-in %s", SELECTOR_VERSION, bad, _BUILTIN_VERSION)
+        _live["rejected"].add(SELECTOR_VERSION)
+        _use_builtin()
+    else:
+        _live["checked"] = True
 
 
 class HarvestError(Exception):
@@ -349,6 +448,7 @@ _JS_EXTRACT_CARDS = r"""
       break;
     }
     const ph = text.match(PHONE);
+    const ll = href.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
 
     out.push({
       name,
@@ -363,6 +463,10 @@ _JS_EXTRACT_CARDS = r"""
       address_line,
       phone: ph ? ph[0] : null,
       category_label,
+      // extended-only fields (harvest_tile strips them unless extended=true)
+      lat: ll ? Number(ll[1]) : null,
+      lng: ll ? Number(ll[2]) : null,
+      closed: /(^|\n)\s*(permanently|temporarily) closed/i.test(text),
     });
   }
   return out;
@@ -570,6 +674,7 @@ async def _run(body, partial: Optional[dict] = None, guarded: bool = True) -> di
     guarded=False (general browsing) skips the Maps budget, circuit breaker
     and challenge cooldown: a blocked random site says nothing about Maps.
     """
+    refresh_selectors()
     if guarded:
         gate = guard.check()
         if gate:
@@ -594,6 +699,7 @@ async def _run(body, partial: Optional[dict] = None, guarded: bool = True) -> di
 
 def _card_from_detail(d: dict, url: str) -> dict:
     cid = _cid_from_url(url)
+    ll = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", url or "")
     return {
         "name": d["name"],
         "maps_cid": cid,
@@ -606,13 +712,25 @@ def _card_from_detail(d: dict, url: str) -> dict:
         "address_line": d["address"],
         "phone": d["phone"],
         "category_label": d["category_label"],
+        "lat": float(ll.group(1)) if ll else None,
+        "lng": float(ll.group(2)) if ll else None,
+        "closed": bool(d.get("permanently_closed") or d.get("temporarily_closed")),
     }
+
+
+_EXTENDED_FIELDS = ("lat", "lng", "closed")
+
+
+def _strip_extended(cards: list) -> list:
+    return [{k: v for k, v in c.items() if k not in _EXTENDED_FIELDS} for c in cards]
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: Optional[int] = None) -> dict:
+async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: Optional[int] = None,
+                       extended: bool = False) -> dict:
+    """extended=True adds lat, lng (from the card link) and closed to each card."""
     partial: dict = {"results": []}
 
     async def body() -> dict:
@@ -629,6 +747,8 @@ async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: 
 
         async with browser.lock:
             page = await browser.page()
+            await _check_live_selectors(page)
+            base["selector_version"] = SELECTOR_VERSION
             await _goto(page, tiles.maps_url(category, lat, lng, int(zoom)))
             state = await _wait_for(page, "feed", CONFIG["feed_wait_s"])
 
@@ -687,7 +807,12 @@ async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: 
                 "total_seen": total,
             }
 
-    return await _run(body, partial)
+    out = await _run(body, partial)
+    if not extended:
+        for key in ("results", "partial_results"):
+            if isinstance(out.get(key), list):
+                out[key] = _strip_extended(out[key])
+    return out
 
 
 async def listing_detail(maps_url: str) -> dict:
@@ -695,6 +820,7 @@ async def listing_detail(maps_url: str) -> dict:
         _validate_maps_url(maps_url)
         async with browser.lock:
             page = await browser.page()
+            await _check_live_selectors(page)
             await _goto(page, maps_url)
             state = await _wait_for(page, "main", CONFIG["detail_wait_s"])
             if not state.get("main"):
@@ -733,6 +859,7 @@ async def check_operating(maps_url: str) -> dict:
         _validate_maps_url(maps_url)
         async with browser.lock:
             page = await browser.page()
+            await _check_live_selectors(page)
             await _goto(page, maps_url)
             state = await _wait_for(page, "main", CONFIG["detail_wait_s"])
             if not state.get("main"):
@@ -1121,6 +1248,7 @@ async def web_presence(name: str, city: Optional[str] = None, phone: Optional[st
         if not blocked:
             async with browser.lock:
                 page = await browser.page()
+                await _check_live_selectors(page)
                 await _pace()
                 await page.goto("https://html.duckduckgo.com/html/?q=" + quote_plus(query), wait_until="domcontentloaded", timeout=30_000)
                 guard.last_nav = time.monotonic()
@@ -1168,6 +1296,7 @@ async def maps_lookup(name: str, city: Optional[str] = None, phone: Optional[str
 
 
 def status() -> dict:
+    refresh_selectors()
     return {
         "selector_version": SELECTOR_VERSION,
         "browser_alive": browser.alive,
