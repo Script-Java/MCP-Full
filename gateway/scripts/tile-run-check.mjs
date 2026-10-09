@@ -74,6 +74,13 @@ w = T.planWork(logRows, towns, new Set());
 assert.deepEqual([w.city, w.category, [...w.already].sort()], ['Aubrey, TX', 'hvac contractor', ['NW', 'center']]);
 w = T.planWork([...logRows, { city: 'Aubrey, TX', category: 'roofing contractor', status: 'partial', sub_area: 'reopened' }], towns, new Set(['aubrey|hvac contractor']));
 assert.deepEqual([w.category, w.already.size], ['roofing contractor', 0]);
+// Partial sub-areas come first, even in a lower-priority town; reopened rows (no sub-areas) don't count.
+w = T.planWork([
+  { city: 'Aubrey', category: 'roofing contractor', status: 'partial', sub_area: 'reopened' },
+  { city: 'Denton', category: 'electrician', status: 'partial', sub_area: 'center' },
+  { city: 'Denton', category: 'electrician', status: 'partial', sub_area: 'NW' },
+], towns, new Set());
+assert.deepEqual([w.city, w.category, [...w.already].sort()], ['Denton', 'electrician', ['NW', 'center']]);
 const allAubrey = new Set(T.CATEGORIES.map((c) => `aubrey|${c}`));
 assert.equal(T.planWork([], towns, allAubrey).town.city, 'Denton');
 assert.equal(T.CATEGORIES.length, 24);
@@ -102,6 +109,7 @@ const db = {
 const rowsFor = (q) => {
   db.queries.push(q);
   if (/^insert into harvest_runs/.test(q)) return [{ id: 7 }];
+  if (/from active_selectors/.test(q) && db.selectorsDown) throw new Error('connection refused');
   if (/from active_selectors/.test(q)) return [{ version: '2026-09-14.1', selectors: { feed: 'div[role="feed"]', website_btn: 'a[data-value="Website"]' } }];
   if (/from spam_coords/.test(q)) return spam;
   if (/from search_log$/.test(q)) return db.log;
@@ -199,6 +207,39 @@ db.queries.length = 0;
 const s3 = await runToEnd(10);
 assert.deepEqual([s3.status, s3.searches], ['selector_broken', 1]);
 assert.ok(!db.queries.some((q) => q.startsWith('insert into search_log')));
+
+// active_selectors unreadable: the copy is removed, so the harvest server uses its built-ins.
+db.selectorsDown = true;
+await T.refreshSelectors();
+assert.equal(fs.existsSync(T.SELECTORS_FILE), false);
+db.selectorsDown = false;
+await T.refreshSelectors();
+assert.equal(JSON.parse(fs.readFileSync(T.SELECTORS_FILE, 'utf8')).version, '2026-09-14.1');
+
+// Run 4: dry run. Geocodes a town once (not saved), counts would-be inserts, writes nothing.
+assert.equal(T.startTileRun({ dry_run: 'yes' }).isError, true);
+const realFetch = globalThis.fetch;
+const fetched = [];
+globalThis.fetch = async (url) => { fetched.push(url); return { json: async () => [{ lat: '33.36', lon: '-96.98' }] }; };
+db.towns = [{ city: 'Pilot Point', priority: 70, lat: null, lng: null, skip: false }];
+db.log = [];
+tiles = [
+  { selector_version: sv, saturated: false, results: [card({ maps_cid: '41' }), card({ name: 'Two', maps_cid: '42', phone: '2145550142' }), card({ name: 'Site', has_website: true, website_url: 'https://s.com' })] },
+  { error: 'challenge_detected', selector_version: sv },
+];
+db.queries.length = 0;
+harvestCalls.length = 0;
+const started4 = JSON.parse(T.startTileRun({ max_searches: 5, dry_run: true }).content[0].text);
+assert.equal(started4.dry_run, true);
+assert.match(started4.run_id, /-dry$/);
+let s4;
+for (let i = 0; i < 200 && !(s4 = JSON.parse(T.tileRunStatus({}).content[0].text), !s4.running); i++) await new Promise((r) => setTimeout(r, 10));
+globalThis.fetch = realFetch;
+assert.deepEqual([s4.dry_run, s4.status, s4.searches, s4.inserted, s4.harvest_run_id], [true, 'challenged', 2, 2, null]);
+assert.deepEqual(db.queries.filter((q) => /^(insert|update|delete)/i.test(q)), [], 'a dry run must not write');
+assert.equal(fetched.length, 1, 'geocoded once per run');
+assert.match(fetched[0], /q=Pilot%20Point%2C%20Texas/);
+assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => [a.category, a.lat, a.lng]), [['plumber', 33.36, -96.98], ['hvac contractor', 33.36, -96.98]]);
 
 await T.stopTileRuns('test over');
 fs.rmSync(tmp, { recursive: true, force: true });

@@ -23,17 +23,20 @@ plus the optional `everything` test server.
 
 `gateway__start_tile_run {max_searches}` runs the Google Maps harvest from
 `docs/harvester-reference.mjs` inside the gateway with no agent: towns from
-`harvest_towns` x 24 categories, resumed from `search_log`, `harvest_tile` at
+`harvest_towns` x 24 categories, resumed from `search_log` (unfinished
+sub-areas first), `harvest_tile` at
 13z (four `subdivide_tile` children when saturated), new no-website leads into
 `"no-Website-lead"`, one `harvest_runs` row per run (`runner = 'server'`).
 `gateway__tile_run_status` reports progress; logs go to `/data/tile-runs/`.
+`dry_run: true` searches and counts but writes nothing to the database.
 Set `TILE_RUN_CRON` (America/Chicago) to run it on a schedule. Tables:
 `docs/migrations.sql`.
 
 Every 5 minutes the gateway copies the `active_selectors` row to
 `/data/harvest/active-selectors.json`; the harvest server applies it over its
 built-in selectors (`website_btn` maps to `card_website`, `rating` is ignored)
-and falls back to the built-ins if it is missing or invalid.
+and falls back to the built-ins if it is missing or invalid. If the table
+can't be read, the gateway removes the copy, so the built-ins apply.
 
 ## Tests
 

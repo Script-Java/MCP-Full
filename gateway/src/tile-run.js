@@ -142,7 +142,10 @@ export function buildInserts(fresh, ctx, selectorVersion) {
   return out;
 }
 
-/** What to search next (reference nextWork, minus the geocoding). */
+/**
+ * What to search next (reference nextWork, minus the geocoding): a city+category with sub-areas
+ * already searched but no 'done' row comes first, then towns by priority x CATEGORIES.
+ */
 export function planWork(logRows, towns, sessionDone) {
   const sample = logRows.find((r) => r.city);
   const cityLabel = (c) => (sample && /,\s*tx$/i.test(sample.city) ? `${c}, TX` : c);
@@ -156,12 +159,14 @@ export function planWork(logRows, towns, sessionDone) {
     for (const a of ['nw', 'ne', 'sw', 'se']) if (new RegExp(`\\b${a}\\b`).test(s)) e.subs.add(a.toUpperCase());
     if (/center|full|whole/.test(s)) e.subs.add('center');
   }
-  for (const t of towns) {
-    for (const cat of CATEGORIES) {
-      const key = `${norm(t.city)}|${cat}`;
-      const e = byKey.get(key);
-      if (e?.done || sessionDone.has(key)) continue;
-      return { key, town: t, city: cityLabel(t.city), category: cat, already: e ? e.subs : new Set() };
+  for (const partialOnly of [true, false]) {
+    for (const t of towns) {
+      for (const cat of CATEGORIES) {
+        const key = `${norm(t.city)}|${cat}`;
+        const e = byKey.get(key);
+        if (e?.done || sessionDone.has(key) || (partialOnly && !e?.subs.size)) continue;
+        return { key, town: t, city: cityLabel(t.city), category: cat, already: e ? e.subs : new Set() };
+      }
     }
   }
   return null;
@@ -236,7 +241,7 @@ async function geocode(city) {
   return { lat: Number(hit.lat), lng: Number(hit.lon) };
 }
 
-/** Copy the active_selectors row to the harvest server's file. Keeps the last copy if the table can't be read. */
+/** Copy the active_selectors row to the harvest server's file; no row, or table unreadable: remove it (built-ins). */
 export async function refreshSelectors() {
   if (!deps?.supabase) return;
   try {
@@ -254,7 +259,8 @@ export async function refreshSelectors() {
     fs.renameSync(`${SELECTORS_FILE}.tmp`, SELECTORS_FILE);
     deps.log.info(`[tile-run] active_selectors ${rows[0].version} copied to ${SELECTORS_FILE}`);
   } catch (err) {
-    deps.log.warn(`[tile-run] active_selectors not refreshed: ${err?.message ?? err}`);
+    deps.log.warn(`[tile-run] active_selectors unreadable, harvest falls back to built-in selectors: ${err?.message ?? err}`);
+    try { fs.rmSync(SELECTORS_FILE, { force: true }); } catch {}
   }
 }
 
@@ -269,11 +275,12 @@ export const START_TILE_RUN_TOOL = {
     'categories, resuming from search_log; each search is harvest_tile at 13z, split into four 14z sub-areas when saturated. ' +
     'Businesses with no website (or only Facebook/Instagram/Linktree) go to public."no-Website-lead"; one harvest_runs row ' +
     'per run (runner server). Stops at once on a Google challenge or a broken selector. 12-30 s pause between searches; ' +
-    'one run at a time. Check progress with tile_run_status.',
+    'one run at a time. dry_run=true searches and reports but writes nothing to the database. Check progress with tile_run_status.',
   inputSchema: {
     type: 'object',
     properties: {
       max_searches: { type: 'integer', minimum: 1, maximum: MAX_SEARCHES_CAP, description: `Maps searches this run (default ${DEFAULT_MAX_SEARCHES}).` },
+      dry_run: { type: 'boolean', description: 'Search and count what would be inserted, but write nothing (no leads, search_log, harvest_runs or geocodes).' },
     },
   },
 };
@@ -289,21 +296,23 @@ export const TILE_RUN_STATUS_TOOL = {
 export function startTileRun(args, trigger = 'tool') {
   const max = Number(args?.max_searches ?? DEFAULT_MAX_SEARCHES);
   if (!Number.isInteger(max) || max < 1 || max > MAX_SEARCHES_CAP) return fail(`max_searches must be an integer 1-${MAX_SEARCHES_CAP}`);
+  if (args?.dry_run !== undefined && typeof args.dry_run !== 'boolean') return fail('dry_run must be true or false');
+  const dry = args?.dry_run === true;
   if (!deps?.harvest || !deps?.supabase) return fail('tile runs need the harvest and supabase servers (is SUPABASE_ACCESS_TOKEN set?)');
   if (current?.running) return fail(`a tile run is already going (${current.id}); check tile_run_status, one run at a time`);
   if (leadRunActive()) return fail('a lead run (start_lead_run) is going; it shares the Maps browser and budget, start the tile run after it');
   fs.mkdirSync(RUN_DIR, { recursive: true });
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-tiles-${max}`;
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-tiles-${max}${dry ? '-dry' : ''}`;
   const file = path.join(RUN_DIR, `${id}.log`);
   const rec = {
-    id, trigger, maxSearches: max, file, started: Date.now(), running: true, harvestRunId: null,
+    id, trigger, dry, maxSearches: max, file, started: Date.now(), running: true, harvestRunId: null,
     status: 'running', stopReason: null, selectorVersion: null, stopRequested: null,
     totals: { searches: 0, seen: 0, inserted: 0, dupes: 0, outOfArea: 0 },
     log: (...a) => fs.appendFileSync(file, `${new Date().toISOString().slice(11, 19)} ${a.join(' ')}\n`),
   };
   current = rec;
   runLoop(rec).catch((err) => deps.log.error(`[tile-run] ${err?.stack ?? err}`));
-  return text({ started: true, run_id: id, max_searches: max, trigger, expected_minutes: Math.ceil((max * 50) / 60) });
+  return text({ started: true, run_id: id, max_searches: max, dry_run: dry, trigger, expected_minutes: Math.ceil((max * 50) / 60) });
 }
 
 async function runLoop(rec) {
@@ -312,9 +321,10 @@ async function runLoop(rec) {
   const where = (category, city, subArea) => `${category} ${city} ${subArea}`;
   let status = 'ok';
   let stopReason = null;
-  rec.log(`tile run ${rec.id}: max ${rec.maxSearches} searches (${rec.trigger})`);
+  rec.log(`tile run ${rec.id}: max ${rec.maxSearches} searches (${rec.trigger})${rec.dry ? ', DRY RUN: nothing is written' : ''}`);
+  const geocoded = new Map(); // dry runs don't save geocodes, so remember them for the run
   try {
-    const [run] = await sql(`insert into harvest_runs (runner, notes) values ('server', ${lit(`server; ${rec.id} (${rec.trigger})`)}) returning id`);
+    const [run] = rec.dry ? [] : await sql(`insert into harvest_runs (runner, notes) values ('server', ${lit(`server; ${rec.id} (${rec.trigger})`)}) returning id`);
     rec.harvestRunId = run?.id ?? null;
     await refreshSelectors();
     const spam = await sql('select lat, lng from spam_coords');
@@ -323,6 +333,7 @@ async function runLoop(rec) {
     const zeroWebsiteIds = [];
 
     const logSearch = async (ctx, stats, st, notes) => {
+      if (rec.dry) return null;
       const [row] = await sql(`insert into search_log (city, category, sub_area, zoom, cards_seen, inserted, duplicates_skipped, out_of_area, status, notes) values (${
         [ctx.city, ctx.category, ctx.subArea, ctx.zoom, stats.seen, stats.inserted, stats.dupes, stats.outOfArea, st, notes].map(lit).join(',')}) returning id`);
       return row?.id ?? null;
@@ -336,9 +347,13 @@ async function runLoop(rec) {
       if (!work) { stopReason = 'town list exhausted — add towns to harvest_towns'; break; }
       const { key, town, city, category, already } = work;
       if (town.lat == null || town.lng == null) {
-        Object.assign(town, await geocode(town.city));
-        await sql(`update harvest_towns set lat=${lit(town.lat)}, lng=${lit(town.lng)}, updated_at=now() where city=${lit(town.city)}`);
-        rec.log(`geocoded ${town.city}: ${town.lat},${town.lng}`);
+        if (!geocoded.has(town.city)) {
+          const g = await geocode(town.city);
+          geocoded.set(town.city, g);
+          if (!rec.dry) await sql(`update harvest_towns set lat=${lit(g.lat)}, lng=${lit(g.lng)}, updated_at=now() where city=${lit(town.city)}`);
+          rec.log(`geocoded ${town.city}: ${g.lat},${g.lng}`);
+        }
+        Object.assign(town, geocoded.get(town.city));
       }
       const lat = Number(town.lat);
       const lng = Number(town.lng);
@@ -396,7 +411,7 @@ async function runLoop(rec) {
           if (zeroWebsiteStreak >= 2) {
             // Probably a broken selector, not two genuinely odd categories: reopen both so they get retried after the fix.
             const ids = zeroWebsiteIds.map(String).filter((x) => /^\d+$/.test(x));
-            if (ids.length) await sql(`update search_log set status='partial', sub_area='reopened', notes=notes || ' (reopened: selector suspected broken)' where id in (${ids.join(',')})`);
+            if (ids.length && !rec.dry) await sql(`update search_log set status='partial', sub_area='reopened', notes=notes || ' (reopened: selector suspected broken)' where id in (${ids.join(',')})`);
             status = 'selector_broken';
             stopReason = `website button matched 0 cards on 2 categories in a row (selectors ${res.selector_version})`;
             break outer;
@@ -406,7 +421,7 @@ async function runLoop(rec) {
         zeroWebsiteStreak = 0;
         zeroWebsiteIds.length = 0;
 
-        const stats = await processCards(cards, ctx, spam, res.selector_version);
+        const stats = await processCards(cards, ctx, spam, res.selector_version, rec.dry);
         totals.seen += stats.seen; totals.inserted += stats.inserted; totals.dupes += stats.dupes; totals.outOfArea += stats.outOfArea;
 
         if (next.subArea === 'center' && res.saturated) needQuadrants = true;
@@ -439,7 +454,7 @@ async function runLoop(rec) {
   }
 }
 
-async function processCards(cards, ctx, spam, selectorVersion) {
+async function processCards(cards, ctx, spam, selectorVersion, dry) {
   const { stats, cand } = filterCards(cards, spam);
   if (!cand.length) return stats;
   const phones = cand.map((c) => c.p10).filter(Boolean);
@@ -457,7 +472,8 @@ async function processCards(cards, ctx, spam, selectorVersion) {
   }
   const fresh = cand.filter((c) => (c.p10 ? !existingPhones.has(c.p10) : !existingNames.has(c.nn)));
   stats.dupes += cand.length - fresh.length;
-  for (const q of buildInserts(fresh, ctx, selectorVersion)) stats.inserted += (await sql(q)).length;
+  if (dry) stats.inserted = fresh.length; // would-be inserts (a concurrent source_id clash could lower it)
+  else for (const q of buildInserts(fresh, ctx, selectorVersion)) stats.inserted += (await sql(q)).length;
   return stats;
 }
 
@@ -469,7 +485,7 @@ function finishRow(rec) {
 }
 
 const summary = (rec) => ({
-  status: rec.status, stop_reason: rec.stopReason, harvest_run_id: rec.harvestRunId, selector_version: rec.selectorVersion,
+  dry_run: Boolean(rec.dry), status: rec.status, stop_reason: rec.stopReason, harvest_run_id: rec.harvestRunId, selector_version: rec.selectorVersion,
   searches: rec.totals.searches, cards_seen: rec.totals.seen, inserted: rec.totals.inserted,
   duplicates: rec.totals.dupes, out_of_area: rec.totals.outOfArea,
 });
