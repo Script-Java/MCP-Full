@@ -241,6 +241,19 @@ assert.equal(fetched.length, 1, 'geocoded once per run');
 assert.match(fetched[0], /q=Pilot%20Point%2C%20Texas/);
 assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => [a.category, a.lat, a.lng]), [['plumber', 33.36, -96.98], ['hvac contractor', 33.36, -96.98]]);
 
+// Run 5: a 116-card centre counts as capped even with saturated=false (reference CAP_THRESHOLD 115).
+db.towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95, skip: false }];
+tiles = [
+  { selector_version: sv, saturated: false, results: Array.from({ length: 116 }, (_, i) => card({ name: `C${i}`, maps_cid: String(5000 + i), phone: `2145559${String(i).padStart(3, '0')}`, has_website: i % 2 === 0, website_url: i % 2 === 0 ? 'https://w.com' : null })) },
+  { error: 'challenge_detected', selector_version: sv },
+];
+db.queries.length = 0;
+harvestCalls.length = 0;
+const s5 = await runToEnd(5);
+assert.deepEqual([s5.status, s5.searches], ['challenged', 2]);
+assert.equal(harvestCalls.filter(([n]) => n === 'harvest_tile')[1][1].zoom, 14, 'next search is the NW child');
+assert.match(db.queries.find((q) => q.startsWith('insert into search_log')), /'partial','server; capped at 116 — next sub-area NW'/);
+
 await T.stopTileRuns('test over');
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('tile-run ok');

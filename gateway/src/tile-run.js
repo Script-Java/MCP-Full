@@ -31,6 +31,9 @@ export const CATEGORIES = [
 ];
 // subdivide_tile returns its children in this order (north row west->east, then south row).
 const SUB_AREAS = ['NW', 'NE', 'SW', 'SE'];
+// Maps caps a feed at ~120; after de-duplication a capped feed often shows 116-119 cards,
+// so (as in the reference) 115+ counts as capped even when harvest_tile's saturated is false.
+const CAP_THRESHOLD = 115;
 const TX_BOX = { minLat: 25.83, maxLat: 36.51, minLng: -106.65, maxLng: -93.5 };
 const SOCIAL_HOSTS = /(^|\.)(facebook\.com|fb\.com|fb\.me|instagram\.com|linktr\.ee)$/i;
 const INSERT_COLS = ['name', 'category', 'address', 'phone', 'city', 'rating', 'review_count', 'google_maps_url',
@@ -424,7 +427,7 @@ async function runLoop(rec) {
         const stats = await processCards(cards, ctx, spam, res.selector_version, rec.dry);
         totals.seen += stats.seen; totals.inserted += stats.inserted; totals.dupes += stats.dupes; totals.outOfArea += stats.outOfArea;
 
-        if (next.subArea === 'center' && res.saturated) needQuadrants = true;
+        if (next.subArea === 'center' && (res.saturated || cards.length >= CAP_THRESHOLD)) needQuadrants = true;
         already.add(next.subArea);
         const remaining = needQuadrants ? SUB_AREAS.filter((s) => !already.has(s)) : [];
         const finished = remaining.length === 0;
