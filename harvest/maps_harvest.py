@@ -14,8 +14,10 @@ Failure modes are enumerated return values, not exceptions:
                          SELECTOR_VERSION.
     timeout              per-call wall clock exceeded (default 60 s).
     circuit_open         too many consecutive empty harvests (likely blocked
-                         or stale selectors); restart the process to reset.
-    budget_exhausted     per-process call budget used up.
+                         or stale selectors); closes again after
+                         HARVEST_CIRCUIT_RESET_S (default 2 h) or a restart.
+    budget_exhausted     call budget for the rolling window (default 500 per
+                         24 h) used up; retry_after_s says when a call frees.
     invalid_argument     bad lat/lng/zoom/url.
     internal             unexpected exception (class name only, no page data).
 
@@ -37,6 +39,7 @@ import random
 import re
 import socket
 import time
+from collections import deque
 import urllib.error
 import urllib.request
 from datetime import date, timedelta
@@ -128,7 +131,9 @@ CONFIG: dict[str, Any] = {
     "pause_min_s": _env_float("HARVEST_PAUSE_MIN_S", 1.8),
     "pause_max_s": _env_float("HARVEST_PAUSE_MAX_S", 4.5),
     "max_consecutive_empty": _env_int("HARVEST_MAX_CONSECUTIVE_EMPTY", 5),
-    "max_calls": _env_int("HARVEST_MAX_CALLS", 500),   # per process
+    "max_calls": _env_int("HARVEST_MAX_CALLS", 500),   # per budget window
+    "budget_window_s": _env_float("HARVEST_BUDGET_WINDOW_S", 86400.0),
+    "circuit_reset_s": _env_float("HARVEST_CIRCUIT_RESET_S", 7200.0),
     "challenge_cooldown_s": _env_float("HARVEST_CHALLENGE_COOLDOWN_S", 900.0),
     "max_scroll_rounds": 40,
     "stall_rounds": 3,
@@ -253,24 +258,57 @@ def error(code: str, **extra: Any) -> dict:
 # Guard: process-wide budget, empty-result circuit breaker, challenge cooldown.
 # ---------------------------------------------------------------------------
 class Guard:
+    """Budget: max_calls per rolling budget_window_s. Circuit: opens after
+    max_consecutive_empty empty harvests, closes circuit_reset_s later."""
+
     def __init__(self) -> None:
-        self.calls = 0
+        self.call_times: deque[float] = deque()
         self.consecutive_empty = 0
+        self.circuit_opened = 0.0
         self.challenge_until = 0.0
         self.last_nav = 0.0
+
+    @property
+    def calls(self) -> int:
+        """Calls inside the current budget window."""
+        cutoff = time.monotonic() - CONFIG["budget_window_s"]
+        while self.call_times and self.call_times[0] <= cutoff:
+            self.call_times.popleft()
+        return len(self.call_times)
+
+    def count_call(self) -> None:
+        self.call_times.append(time.monotonic())
+
+    def _circuit_open(self, now: float) -> bool:
+        if self.consecutive_empty < CONFIG["max_consecutive_empty"]:
+            return False
+        if now - self.circuit_opened >= CONFIG["circuit_reset_s"]:
+            log.info("circuit breaker closed after %ds", int(CONFIG["circuit_reset_s"]))
+            self.consecutive_empty = 0
+            self.circuit_opened = 0.0
+            return False
+        return True
 
     def check(self) -> Optional[dict]:
         now = time.monotonic()
         if now < self.challenge_until:
             return error("challenge_detected", retry_after_s=int(self.challenge_until - now))
-        if self.consecutive_empty >= CONFIG["max_consecutive_empty"]:
-            return error("circuit_open", consecutive_empty=self.consecutive_empty)
+        if self._circuit_open(now):
+            return error("circuit_open", consecutive_empty=self.consecutive_empty,
+                         retry_after_s=int(self.circuit_opened + CONFIG["circuit_reset_s"] - now))
         if self.calls >= CONFIG["max_calls"]:
-            return error("budget_exhausted", calls=self.calls)
+            return error("budget_exhausted", calls=self.calls,
+                         retry_after_s=int(self.call_times[0] + CONFIG["budget_window_s"] - now) + 1)
         return None
 
     def note_result(self, count: int) -> None:
-        self.consecutive_empty = 0 if count > 0 else self.consecutive_empty + 1
+        if count > 0:
+            self.consecutive_empty = 0
+            self.circuit_opened = 0.0
+            return
+        self.consecutive_empty += 1
+        if self.consecutive_empty == CONFIG["max_consecutive_empty"]:
+            self.circuit_opened = time.monotonic()
 
     def trip_challenge(self) -> None:
         self.challenge_until = time.monotonic() + CONFIG["challenge_cooldown_s"]
@@ -281,7 +319,7 @@ class Guard:
             "calls": self.calls,
             "max_calls": CONFIG["max_calls"],
             "consecutive_empty": self.consecutive_empty,
-            "circuit_open": self.consecutive_empty >= CONFIG["max_consecutive_empty"],
+            "circuit_open": self._circuit_open(now),
             "challenge_cooldown_remaining_s": max(0, int(self.challenge_until - now)),
         }
 
@@ -476,6 +514,11 @@ _JS_EXTRACT_CARDS = r"""
   }
   return out;
 }
+"""
+
+# Place links in the feed, independent of the card selectors (empty-result sanity check).
+_JS_PLACE_LINKS = r"""
+(S) => { const f = document.querySelector(S.feed); return f ? f.querySelectorAll('a[href*="/maps/place/"]').length : 0; }
 """
 
 _JS_EXTRACT_DETAIL = r"""
@@ -684,7 +727,7 @@ async def _run(body, partial: Optional[dict] = None, guarded: bool = True) -> di
         gate = guard.check()
         if gate:
             return gate
-        guard.calls += 1
+        guard.count_call()
     try:
         return await asyncio.wait_for(body(), timeout=CONFIG["timeout_s"])
     except asyncio.TimeoutError:
@@ -758,7 +801,8 @@ async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: 
             state = await _wait_for(page, "feed", CONFIG["feed_wait_s"])
 
             if state.get("no_results"):
-                guard.note_result(0)
+                # Google's own "no results" page: the page rendered, so it says
+                # nothing about blocking; leave the circuit breaker alone.
                 return {**base, "results": [], "saturated": False, "truncated": False, "no_results": True}
 
             if not state.get("feed"):
@@ -803,6 +847,9 @@ async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: 
 
             total = len(cards)
             results = cards[:lim]
+            if not total and await page.evaluate(_JS_PLACE_LINKS, SELECTORS):
+                guard.note_result(0)
+                raise HarvestError("selectors_stale", hint="feed has place links but the card selectors matched none")
             guard.note_result(len(results))
             return {
                 **base,

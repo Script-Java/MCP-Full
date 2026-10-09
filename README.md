@@ -24,13 +24,22 @@ plus the optional `everything` test server.
 `gateway__start_tile_run {max_searches}` runs the Google Maps harvest from
 `docs/harvester-reference.mjs` inside the gateway with no agent: towns from
 `harvest_towns` x 24 categories, resumed from `search_log` (unfinished
-sub-areas first), `harvest_tile` at
-13z (four `subdivide_tile` children when saturated), new no-website leads into
+sub-areas first), `harvest_tile` at 13z: the town point, or a 13z grid over the
+town's boundary (Nominatim) for towns bigger than one search. An area with 115+
+cards is split into its four `subdivide_tile` children, again down to
+`TILE_RUN_MAX_ZOOM` (default 15); `sub_area` names the path (`center`, `NW`,
+`NW-NE`, `g3`, `g3-SW`). New no-website leads go into
 `"no-Website-lead"`, one `harvest_runs` row per run (`runner = 'server'`).
 `gateway__tile_run_status` reports progress; logs go to `/data/tile-runs/`.
 `dry_run: true` searches and counts but writes nothing to the database.
 Set `TILE_RUN_CRON` (America/Chicago) to run it on a schedule. Tables:
 `docs/migrations.sql`.
+
+The harvest server allows `HARVEST_MAX_CALLS` (500) Maps calls per rolling
+`HARVEST_BUDGET_WINDOW_S` (24 h); its circuit breaker (5 empty harvests in a
+row) closes again after `HARVEST_CIRCUIT_RESET_S` (2 h). Google's own "no
+results" page doesn't count as empty, and an empty feed that still has place
+links is reported as `selectors_stale`.
 
 Every 5 minutes the gateway copies the `active_selectors` row to
 `/data/harvest/active-selectors.json`; the harvest server applies it over its
@@ -43,7 +52,7 @@ can't be read, the gateway removes the copy, so the built-ins apply.
 ```sh
 node gateway/scripts/local-tools-check.mjs
 node gateway/scripts/tile-run-check.mjs
-python harvest/test_presence.py && python harvest/test_selectors.py && python harvest/test_licenses.py
+python harvest/test_presence.py && python harvest/test_selectors.py && python harvest/test_guard.py && python harvest/test_licenses.py
 ```
 
 ## Layout

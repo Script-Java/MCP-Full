@@ -64,23 +64,45 @@ assert.equal(T.buildInserts(Array(120).fill(f.cand[0]), { city: 'X', category: '
 // ---- work picking / resume ----
 const towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95 }, { city: 'Denton', priority: 90, lat: null, lng: null }];
 let w = T.planWork([], towns, new Set());
-assert.deepEqual([w.city, w.category, [...w.already]], ['Aubrey', 'plumber', []]);
+assert.deepEqual([w.city, w.category, [...w.searched]], ['Aubrey', 'plumber', []]);
 const logRows = [
   { city: 'Aubrey, TX', category: 'plumber', status: 'done', sub_area: 'center' },
   { city: 'Aubrey, TX', category: 'hvac contractor', status: 'partial', sub_area: 'center' },
   { city: 'Aubrey, TX', category: 'hvac contractor', status: 'partial', sub_area: 'NW' },
 ];
 w = T.planWork(logRows, towns, new Set());
-assert.deepEqual([w.city, w.category, [...w.already].sort()], ['Aubrey, TX', 'hvac contractor', ['NW', 'center']]);
+assert.deepEqual([w.city, w.category, [...w.searched].sort(), [...w.capped]], ['Aubrey, TX', 'hvac contractor', ['NW', 'center'], ['center']]);
 w = T.planWork([...logRows, { city: 'Aubrey, TX', category: 'roofing contractor', status: 'partial', sub_area: 'reopened' }], towns, new Set(['aubrey|hvac contractor']));
-assert.deepEqual([w.category, w.already.size], ['roofing contractor', 0]);
+assert.deepEqual([w.category, w.searched.size], ['roofing contractor', 0]);
 // Partial sub-areas come first, even in a lower-priority town; reopened rows (no sub-areas) don't count.
 w = T.planWork([
   { city: 'Aubrey', category: 'roofing contractor', status: 'partial', sub_area: 'reopened' },
   { city: 'Denton', category: 'electrician', status: 'partial', sub_area: 'center' },
   { city: 'Denton', category: 'electrician', status: 'partial', sub_area: 'NW' },
 ], towns, new Set());
-assert.deepEqual([w.city, w.category, [...w.already].sort()], ['Denton', 'electrician', ['NW', 'center']]);
+assert.deepEqual([w.city, w.category, [...w.searched].sort()], ['Denton', 'electrician', ['NW', 'center']]);
+// Sub-area paths: server names, agent free text, nesting, zoom, pending order.
+assert.deepEqual(T.parseSubArea('center'), ['center']);
+assert.deepEqual(T.parseSubArea('nw-ne'), ['NW-NE']);
+assert.deepEqual(T.parseSubArea('g3-sw-ne'), ['g3-SW-NE']);
+assert.deepEqual(T.parseSubArea('reopened'), []);
+assert.deepEqual(T.parseSubArea('NW quadrant @33.183037,-96.878532,14z (child of center @33.1507,-96.8236,13z)').sort(), ['NW', 'center']);
+assert.deepEqual(T.parseSubArea('SE quadrant @33.118363,-96.768668,14z (final quadrant)'), ['SE']);
+assert.deepEqual([T.parentArea('NW'), T.parentArea('NW-NE'), T.parentArea('g3-SW'), T.parentArea('g3'), T.parentArea('center')], ['center', 'NW', 'g3', null, null]);
+assert.deepEqual(['center', 'NW', 'NW-NE', 'g2', 'g2-SE', 'g2-SE-NW'].map(T.areaZoom), [13, 14, 15, 13, 14, 15]);
+assert.deepEqual(T.pendingAreas(['center'], new Set(), new Set()), ['center']);
+assert.deepEqual(T.pendingAreas(['center'], new Set(['center']), new Set()), []);
+assert.deepEqual(T.pendingAreas(['center'], new Set(['center', 'NW']), new Set(['center', 'NW']), 15), ['NW-NW', 'NW-NE', 'NW-SW', 'NW-SE', 'NE', 'SW', 'SE']);
+assert.deepEqual(T.pendingAreas(['center'], new Set(['center', 'NW', 'NW-NW']), new Set(['center', 'NW', 'NW-NW']), 15).slice(0, 2), ['NW-NE', 'NW-SW'], 'no split below max zoom');
+assert.deepEqual(T.pendingAreas(['g0', 'g1'], new Set(['g0']), new Set()), ['g1']);
+// Capped from cards_seen (a 14z quadrant with 120 cards gets split again on resume).
+w = T.planWork([
+  { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'center', cards_seen: 119 },
+  { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'NW', cards_seen: 120 },
+  { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'NE', cards_seen: 80 },
+], [{ city: 'Frisco', priority: 100, lat: 33.15, lng: -96.82 }], new Set());
+assert.deepEqual([...w.capped].sort(), ['NW', 'center']);
+assert.deepEqual(T.pendingAreas(['center'], w.searched, w.capped, 15), ['NW-NW', 'NW-NE', 'NW-SW', 'NW-SE', 'SW', 'SE']);
 const allAubrey = new Set(T.CATEGORIES.map((c) => `aubrey|${c}`));
 assert.equal(T.planWork([], towns, allAubrey).town.city, 'Denton');
 assert.equal(T.CATEGORIES.length, 24);
@@ -121,6 +143,14 @@ const rowsFor = (q) => {
   if (/^update /.test(q)) return [];
   throw new Error(`unexpected sql: ${q.slice(0, 80)}`);
 };
+// Fake Nominatim: boundary boxes per town (Big Town is larger than one 13z search).
+const BBOX = { 'Big Town': ['32.6', '33.0', '-97.0', '-96.5'] };
+const fetched = [];
+globalThis.fetch = async (url) => {
+  fetched.push(url);
+  const city = decodeURIComponent(url.match(/q=([^&]+)/)[1]).replace(/, Texas$/, '');
+  return { json: async () => [{ lat: '33.3', lon: '-96.95', boundingbox: BBOX[city] ?? ['33.28', '33.32', '-96.98', '-96.92'] }] };
+};
 const reply = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }] });
 const supabase = {
   callTool: async (name, { query }) => {
@@ -135,7 +165,13 @@ const harvest = {
   callTool: async (name, args) => {
     harvestCalls.push([name, args]);
     if (name === 'subdivide_tile') {
-      return reply({ children: [[1, -1], [1, 1], [-1, -1], [-1, 1]].map(([dy, dx]) => ({ lat: args.lat + dy * 0.0324, lng: args.lng + dx * 0.0549, zoom: 14 })) });
+      const k = 2 ** (args.zoom - 13);
+      return reply({ children: [[1, -1], [1, 1], [-1, -1], [-1, 1]].map(([dy, dx]) => ({ lat: +(args.lat + dy * 0.0324 / k).toFixed(6), lng: +(args.lng + dx * 0.0549 / k).toFixed(6), zoom: args.zoom + 1 })) });
+    }
+    if (name === 'grid_tiles') {
+      const big = args.north - args.south > 0.2;
+      const pts = big ? [[32.65, -96.9], [32.65, -96.6], [32.95, -96.9], [32.95, -96.6]] : [[(args.south + args.north) / 2, (args.west + args.east) / 2]];
+      return reply({ count: pts.length, tiles: pts.map(([lat, lng]) => ({ lat, lng, zoom: args.zoom })), truncated: false });
     }
     assert.equal(name, 'harvest_tile');
     return reply(tiles.shift() ?? { error: 'internal' });
@@ -218,9 +254,7 @@ assert.equal(JSON.parse(fs.readFileSync(T.SELECTORS_FILE, 'utf8')).version, '202
 
 // Run 4: dry run. Geocodes a town once (not saved), counts would-be inserts, writes nothing.
 assert.equal(T.startTileRun({ dry_run: 'yes' }).isError, true);
-const realFetch = globalThis.fetch;
-const fetched = [];
-globalThis.fetch = async (url) => { fetched.push(url); return { json: async () => [{ lat: '33.36', lon: '-96.98' }] }; };
+fetched.length = 0;
 db.towns = [{ city: 'Pilot Point', priority: 70, lat: null, lng: null, skip: false }];
 db.log = [];
 tiles = [
@@ -234,12 +268,11 @@ assert.equal(started4.dry_run, true);
 assert.match(started4.run_id, /-dry$/);
 let s4;
 for (let i = 0; i < 200 && !(s4 = JSON.parse(T.tileRunStatus({}).content[0].text), !s4.running); i++) await new Promise((r) => setTimeout(r, 10));
-globalThis.fetch = realFetch;
 assert.deepEqual([s4.dry_run, s4.status, s4.searches, s4.inserted, s4.harvest_run_id], [true, 'challenged', 2, 2, null]);
 assert.deepEqual(db.queries.filter((q) => /^(insert|update|delete)/i.test(q)), [], 'a dry run must not write');
 assert.equal(fetched.length, 1, 'geocoded once per run');
 assert.match(fetched[0], /q=Pilot%20Point%2C%20Texas/);
-assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => [a.category, a.lat, a.lng]), [['plumber', 33.36, -96.98], ['hvac contractor', 33.36, -96.98]]);
+assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').map(([, a]) => [a.category, a.lat, a.lng]), [['plumber', 33.3, -96.95], ['hvac contractor', 33.3, -96.95]]);
 
 // Run 5: a 116-card centre counts as capped even with saturated=false (reference CAP_THRESHOLD 115).
 db.towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95, skip: false }];
@@ -253,6 +286,41 @@ const s5 = await runToEnd(5);
 assert.deepEqual([s5.status, s5.searches], ['challenged', 2]);
 assert.equal(harvestCalls.filter(([n]) => n === 'harvest_tile')[1][1].zoom, 14, 'next search is the NW child');
 assert.match(db.queries.find((q) => q.startsWith('insert into search_log')), /'partial','server; capped at 116 — next sub-area NW'/);
+
+// Run 6: capped quadrant is split again (15z); a capped 15z area is not (max zoom).
+const many = (n, base) => ({ selector_version: sv, saturated: false, results: Array.from({ length: n }, (_, i) => card({ name: `M${base}-${i}`, maps_cid: String(base + i), phone: `2146${String(base + i).padStart(6, '0')}`, has_website: i % 2 === 0, website_url: i % 2 === 0 ? 'https://w.com' : null })) });
+db.log = [];
+tiles = [many(116, 10000), many(118, 20000), many(116, 30000), many(3, 40000), many(3, 41000), many(3, 42000), many(3, 43000), many(3, 44000), many(3, 45000), { error: 'challenge_detected', selector_version: sv }];
+db.queries.length = 0;
+harvestCalls.length = 0;
+const s6 = await runToEnd(20);
+const logged6 = db.queries.filter((q) => q.startsWith('insert into search_log')).map((q) => q.match(/'plumber','([^']+)','(\d+)'/).slice(1).join('@'));
+assert.deepEqual(logged6, ['center@13', 'NW@14', 'NW-NW@15', 'NW-NE@15', 'NW-SW@15', 'NW-SE@15', 'NE@14', 'SW@14', 'SE@14']);
+const notes6 = db.queries.filter((q) => q.startsWith('insert into search_log'));
+assert.match(notes6[2], /'partial','server; capped at 116 at max zoom 15 — next sub-area NW-NE'/);
+assert.match(notes6[8], /'done','server; closed 0, incomplete 0'/);
+assert.deepEqual([s6.searches, s6.status], [10, 'challenged']); // then on to the next category
+
+// Run 7: a city+category already under way keeps its scheme, even in a town with a big boundary.
+db.towns = [{ city: 'Big Town', priority: 5, lat: 32.8, lng: -96.75, skip: false }];
+db.log = [{ city: 'Big Town', category: 'plumber', status: 'partial', sub_area: 'center', cards_seen: 120 }];
+tiles = [many(3, 50000)];
+db.queries.length = 0;
+harvestCalls.length = 0;
+await runToEnd(1);
+assert.match(db.queries.find((q) => q.startsWith('insert into search_log')), /'Big Town','plumber','NW','14'/);
+
+// Run 8: a fresh city+category in a big town is searched as a 13z grid over its boundary.
+db.log = [];
+tiles = [many(3, 60000), many(3, 61000), many(3, 62000), many(3, 63000), { error: 'challenge_detected', selector_version: sv }];
+db.queries.length = 0;
+harvestCalls.length = 0;
+const s8 = await runToEnd(10);
+const logged8 = db.queries.filter((q) => q.startsWith('insert into search_log')).map((q) => q.match(/'Big Town','plumber','([^']+)','(\d+)',.*'(done|partial)'/).slice(1).join('@'));
+assert.deepEqual(logged8, ['g0@13@partial', 'g1@13@partial', 'g2@13@partial', 'g3@13@done']);
+assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').slice(0, 4).map(([, a]) => [a.lat, a.lng, a.zoom]), [[32.65, -96.9, 13], [32.65, -96.6, 13], [32.95, -96.9, 13], [32.95, -96.6, 13]]);
+assert.equal(s8.status, 'challenged');
+assert.equal(fetched.filter((u) => u.includes('Big%20Town')).length, 1, 'boundary looked up once per process');
 
 await T.stopTileRuns('test over');
 fs.rmSync(tmp, { recursive: true, force: true });

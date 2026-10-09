@@ -30,10 +30,13 @@ export const CATEGORIES = [
   'locksmith', 'welding service', 'mobile mechanic', 'towing service', 'septic service', 'moving company',
 ];
 // subdivide_tile returns its children in this order (north row west->east, then south row).
-const SUB_AREAS = ['NW', 'NE', 'SW', 'SE'];
+const QUADS = ['NW', 'NE', 'SW', 'SE'];
 // Maps caps a feed at ~120; after de-duplication a capped feed often shows 116-119 cards,
 // so (as in the reference) 115+ counts as capped even when harvest_tile's saturated is false.
 const CAP_THRESHOLD = 115;
+const ROOT_ZOOM = 13;
+// Capped sub-areas are split again down to this zoom (13 centre, 14 quadrants, 15, ...).
+const MAX_ZOOM = Math.min(Math.max(Number(process.env.TILE_RUN_MAX_ZOOM || 15), 14), 17);
 const TX_BOX = { minLat: 25.83, maxLat: 36.51, minLng: -106.65, maxLng: -93.5 };
 const SOCIAL_HOSTS = /(^|\.)(facebook\.com|fb\.com|fb\.me|instagram\.com|linktr\.ee)$/i;
 const INSERT_COLS = ['name', 'category', 'address', 'phone', 'city', 'rating', 'review_count', 'google_maps_url',
@@ -145,9 +148,50 @@ export function buildInserts(fresh, ctx, selectorVersion) {
   return out;
 }
 
+// ---- sub-areas ----------------------------------------------------------------
+// A city+category is searched as a tree of map areas, named in search_log.sub_area:
+//   'center'        the town point at 13z (towns that fit one search)
+//   'g0', 'g1', ... 13z grid cells over the town's boundary (bigger towns)
+//   then one quadrant per level below a capped area: 'NW' (child of center, as before),
+//   'NW-NE' (15z), 'g3-SW' (14z), 'g3-SW-NE' (15z), ...
+const AREA_RE = /^(center|g\d+|(?:NW|NE|SW|SE))((?:-(?:NW|NE|SW|SE))*)$/i;
+
+/** search_log.sub_area -> area paths it covers ('reopened', 'all' -> none; agent free text -> legacy words). */
+export function parseSubArea(subArea) {
+  const raw = String(subArea ?? 'center').trim();
+  const m = raw.match(AREA_RE);
+  const root = m && (/^center$/i.test(m[1]) ? 'center' : /^g/i.test(m[1]) ? m[1].toLowerCase() : m[1].toUpperCase());
+  if (m && !(root === 'center' && m[2])) return [root + m[2].toUpperCase()];
+  if (/^(reopened|all)$/i.test(raw)) return [];
+  const s = raw.toLowerCase();
+  const out = QUADS.filter((q) => new RegExp(`\\b${q.toLowerCase()}\\b`).test(s));
+  if (/center|full|whole/.test(s)) out.push('center');
+  return out;
+}
+
+export function parentArea(path) {
+  const i = path.lastIndexOf('-');
+  if (i > 0) return path.slice(0, i);
+  return QUADS.includes(path) ? 'center' : null;
+}
+export const childAreas = (path) => QUADS.map((q) => (path === 'center' ? q : `${path}-${q}`));
+export const areaZoom = (path) => ROOT_ZOOM + (path === 'center' || /^g\d+$/.test(path) ? 0 : path.split('-').filter((x) => QUADS.includes(x)).length);
+
+/** Areas still to search, in order: each unsearched root, and the children of every searched, capped area above maxZoom. */
+export function pendingAreas(roots, searched, capped, maxZoom = MAX_ZOOM) {
+  const out = [];
+  const visit = (p) => {
+    if (!searched.has(p)) { out.push(p); return; }
+    if (capped.has(p) && areaZoom(p) < maxZoom) childAreas(p).forEach(visit);
+  };
+  roots.forEach(visit);
+  return out;
+}
+
 /**
- * What to search next (reference nextWork, minus the geocoding): a city+category with sub-areas
+ * What to search next (reference nextWork, minus the geocoding): a city+category with areas
  * already searched but no 'done' row comes first, then towns by priority x CATEGORIES.
+ * An area counts as capped when it saw CAP_THRESHOLD+ cards or any of its children was searched.
  */
 export function planWork(logRows, towns, sessionDone) {
   const sample = logRows.find((r) => r.city);
@@ -155,20 +199,25 @@ export function planWork(logRows, towns, sessionDone) {
   const byKey = new Map();
   for (const r of logRows) {
     const k = `${norm(r.city)}|${(r.category || '').toLowerCase()}`;
-    if (!byKey.has(k)) byKey.set(k, { done: false, subs: new Set() });
+    if (!byKey.has(k)) byKey.set(k, { done: false, searched: new Set(), capped: new Set() });
     const e = byKey.get(k);
     if (r.status === 'done') e.done = true;
-    const s = (r.sub_area || 'center').toLowerCase();
-    for (const a of ['nw', 'ne', 'sw', 'se']) if (new RegExp(`\\b${a}\\b`).test(s)) e.subs.add(a.toUpperCase());
-    if (/center|full|whole/.test(s)) e.subs.add('center');
+    for (const p of parseSubArea(r.sub_area)) {
+      e.searched.add(p);
+      if (Number(r.cards_seen) >= CAP_THRESHOLD) e.capped.add(p);
+    }
+  }
+  for (const e of byKey.values()) {
+    for (const p of e.searched) for (let q = parentArea(p); q; q = parentArea(q)) e.capped.add(q);
   }
   for (const partialOnly of [true, false]) {
     for (const t of towns) {
       for (const cat of CATEGORIES) {
         const key = `${norm(t.city)}|${cat}`;
         const e = byKey.get(key);
-        if (e?.done || sessionDone.has(key) || (partialOnly && !e?.subs.size)) continue;
-        return { key, town: t, city: cityLabel(t.city), category: cat, already: e ? e.subs : new Set() };
+        if (e?.done || sessionDone.has(key) || (partialOnly && !e?.searched.size)) continue;
+        return { key, town: t, city: cityLabel(t.city), category: cat,
+          searched: e ? e.searched : new Set(), capped: e ? e.capped : new Set() };
       }
     }
   }
@@ -241,7 +290,28 @@ async function geocode(city) {
   const res = await fetch(url, { headers: { 'User-Agent': 'unasystems-harvester/1.0 (lead research)' }, signal: AbortSignal.timeout(20000) });
   const [hit] = await res.json();
   if (!hit || !Number.isFinite(Number(hit.lat)) || !Number.isFinite(Number(hit.lon))) throw new Error(`could not geocode ${city}`);
-  return { lat: Number(hit.lat), lng: Number(hit.lon) };
+  const [south, north, west, east] = (hit.boundingbox ?? []).map(Number);
+  const bbox = [south, north, west, east].every(Number.isFinite) && south < north && west < east ? { south, west, north, east } : null;
+  return { lat: Number(hit.lat), lng: Number(hit.lon), bbox };
+}
+
+// Per process: Nominatim answers (point + boundary box) and the 13z grid per town.
+const townGeo = new Map();
+async function geoFor(city) {
+  if (!townGeo.has(city)) townGeo.set(city, await geocode(city));
+  return townGeo.get(city);
+}
+
+/** 13z grid cells over the town's boundary box; [] when the town fits one search. */
+async function townGrid(city) {
+  const g = await geoFor(city);
+  if (!g.bbox) return [];
+  if (!g.grid) {
+    const r = await callJson(deps.harvest, 'grid_tiles', { ...g.bbox, zoom: ROOT_ZOOM });
+    if (!Array.isArray(r.tiles)) throw new Error(`grid_tiles failed for ${city}: ${JSON.stringify(r).slice(0, 200)}`);
+    g.grid = r.tiles.length > 1 ? r.tiles.map((t) => ({ lat: t.lat, lng: t.lng, zoom: t.zoom })) : [];
+  }
+  return g.grid;
 }
 
 /** Copy the active_selectors row to the harvest server's file; no row, or table unreadable: remove it (built-ins). */
@@ -275,7 +345,8 @@ export const START_TILE_RUN_TOOL = {
   name: 'start_tile_run',
   description:
     'Start a server-side Google Maps harvest run and return at once: towns from harvest_towns (priority order) x 24 trade ' +
-    'categories, resuming from search_log; each search is harvest_tile at 13z, split into four 14z sub-areas when saturated. ' +
+    'categories, resuming from search_log; each search is harvest_tile at 13z (a 13z grid over bigger towns), and a capped ' +
+    `area (115+ cards) is split into four sub-areas, down to ${MAX_ZOOM}z. ` +
     'Businesses with no website (or only Facebook/Instagram/Linktree) go to public."no-Website-lead"; one harvest_runs row ' +
     'per run (runner server). Stops at once on a Google challenge or a broken selector. 12-30 s pause between searches; ' +
     'one run at a time. dry_run=true searches and reports but writes nothing to the database. Check progress with tile_run_status.',
@@ -325,7 +396,6 @@ async function runLoop(rec) {
   let status = 'ok';
   let stopReason = null;
   rec.log(`tile run ${rec.id}: max ${rec.maxSearches} searches (${rec.trigger})${rec.dry ? ', DRY RUN: nothing is written' : ''}`);
-  const geocoded = new Map(); // dry runs don't save geocodes, so remember them for the run
   try {
     const [run] = rec.dry ? [] : await sql(`insert into harvest_runs (runner, notes) values ('server', ${lit(`server; ${rec.id} (${rec.trigger})`)}) returning id`);
     rec.harvestRunId = run?.id ?? null;
@@ -345,46 +415,52 @@ async function runLoop(rec) {
     outer: while (totals.searches < rec.maxSearches) {
       if (rec.stopRequested) break;
       if (minutes() > MAX_MINUTES) { stopReason = 'time cap'; break; }
-      const work = planWork(await sql('select city, category, status, sub_area from search_log'),
+      const work = planWork(await sql('select city, category, status, sub_area, cards_seen from search_log'),
         await sql('select * from harvest_towns where not skip order by priority'), sessionDone);
       if (!work) { stopReason = 'town list exhausted — add towns to harvest_towns'; break; }
-      const { key, town, city, category, already } = work;
+      const { key, town, city, category, searched, capped } = work;
       if (town.lat == null || town.lng == null) {
-        if (!geocoded.has(town.city)) {
-          const g = await geocode(town.city);
-          geocoded.set(town.city, g);
-          if (!rec.dry) await sql(`update harvest_towns set lat=${lit(g.lat)}, lng=${lit(g.lng)}, updated_at=now() where city=${lit(town.city)}`);
+        const g = await geoFor(town.city);
+        if (!g.saved && !rec.dry) {
+          await sql(`update harvest_towns set lat=${lit(g.lat)}, lng=${lit(g.lng)}, updated_at=now() where city=${lit(town.city)}`);
+          g.saved = true;
           rec.log(`geocoded ${town.city}: ${g.lat},${g.lng}`);
         }
-        Object.assign(town, geocoded.get(town.city));
+        Object.assign(town, { lat: g.lat, lng: g.lng });
       }
-      const lat = Number(town.lat);
-      const lng = Number(town.lng);
 
-      // Centre first at 13z. If it was saturated (now or in an earlier partial run), do the four children.
-      let needQuadrants = already.size > 0;
-      let children = null;
-      const pending = already.has('center') ? [] : [{ subArea: 'center', lat, lng, zoom: 13 }];
-      const nextArea = async () => {
-        if (pending.length) return pending.shift();
-        if (!needQuadrants) return null;
-        const name = SUB_AREAS.find((s) => !already.has(s));
-        if (!name) return null;
-        if (!children) {
-          const sub = await callJson(deps.harvest, 'subdivide_tile', { lat, lng, zoom: 13 });
-          if (!Array.isArray(sub.children) || sub.children.length !== 4) throw new Error(`subdivide_tile failed: ${JSON.stringify(sub).slice(0, 200)}`);
-          children = sub.children;
-        }
-        const c = children[SUB_AREAS.indexOf(name)];
-        return { subArea: name, lat: c.lat, lng: c.lng, zoom: c.zoom };
+      // Roots: the town point, or a 13z grid for towns bigger than one search. A city+category
+      // already under way keeps the scheme it started with.
+      const coords = new Map();
+      let roots = ['center'];
+      const gridStarted = [...searched].some((p) => p.startsWith('g'));
+      if (gridStarted || !searched.size) {
+        const grid = await townGrid(town.city);
+        if (grid.length) {
+          roots = grid.map((_, i) => `g${i}`);
+          grid.forEach((t, i) => coords.set(`g${i}`, t));
+          if (!searched.size) rec.log(`${town.city}: ${grid.length} grid cells at ${ROOT_ZOOM}z`);
+        } else if (gridStarted) throw new Error(`${town.city}: grid search under way but its boundary no longer gives a grid`);
+      }
+      coords.set('center', { lat: Number(town.lat), lng: Number(town.lng), zoom: ROOT_ZOOM });
+      const coordsOf = async (p) => {
+        if (coords.has(p)) return coords.get(p);
+        const parent = parentArea(p);
+        const pc = await coordsOf(parent);
+        const sub = await callJson(deps.harvest, 'subdivide_tile', pc);
+        if (!Array.isArray(sub.children) || sub.children.length !== 4) throw new Error(`subdivide_tile failed: ${JSON.stringify(sub).slice(0, 200)}`);
+        childAreas(parent).forEach((c, i) => coords.set(c, { lat: sub.children[i].lat, lng: sub.children[i].lng, zoom: sub.children[i].zoom }));
+        return coords.get(p);
       };
 
       let didAny = false;
-      for (let next = await nextArea(); next; next = await nextArea()) {
+      for (let pending = pendingAreas(roots, searched, capped); pending.length; pending = pendingAreas(roots, searched, capped)) {
         didAny = true;
         if (totals.searches >= rec.maxSearches || minutes() > MAX_MINUTES || rec.stopRequested) break outer;
         if (totals.searches > 0) await sleep(MIN_DELAY_MS + Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS)); // be gentle with Maps
         if (rec.stopRequested) break outer;
+        const subArea = pending[0];
+        const next = { subArea, ...(await coordsOf(subArea)) };
         const ctx = { city, category, ...next };
         const res = await callJson(deps.harvest, 'harvest_tile',
           { category, lat: next.lat, lng: next.lng, zoom: next.zoom, limit: 120, extended: true });
@@ -392,10 +468,11 @@ async function runLoop(rec) {
         if (res.selector_version) rec.selectorVersion = res.selector_version;
         if (res.error || !Array.isArray(res.results)) {
           const code = res.error ?? 'internal';
-          const at = where(category, city, next.subArea);
-          if (code === 'challenge_detected' || code === 'circuit_open') { status = 'challenged'; stopReason = `${code} on ${at}`; }
+          const at = where(category, city, subArea);
+          if (code === 'challenge_detected') { status = 'challenged'; stopReason = `${code} on ${at}`; }
+          else if (code === 'circuit_open') { status = 'challenged'; stopReason = `circuit_open on ${at}: ${res.consecutive_empty ?? 'several'} empty searches in a row (blocked, or broken selectors); closes in ${res.retry_after_s ?? '?'}s`; }
           else if (code === 'selectors_stale') { status = 'selector_broken'; stopReason = `selectors_stale (${res.hint ?? 'feed not found'}) on ${at}`; }
-          else if (code === 'budget_exhausted') { status = 'stopped'; stopReason = `harvest budget exhausted (${res.calls ?? '?'} calls; resets when the harvest server restarts)`; }
+          else if (code === 'budget_exhausted') { status = 'stopped'; stopReason = `harvest budget exhausted (${res.calls ?? '?'} calls in 24 h; next call frees in ${res.retry_after_s ?? '?'}s)`; }
           else { status = 'error'; stopReason = `harvest_tile ${code}${res.reason ? ` (${res.reason})` : ''} on ${at}`; }
           rec.log(`${at} → ${code}, stopping`);
           break outer;
@@ -410,7 +487,7 @@ async function runLoop(rec) {
           zeroWebsiteIds.push(await logSearch(ctx, { seen: cards.length, inserted: 0, dupes: 0, outOfArea: 0 }, 'done',
             'server; website button matched 0 cards — category skipped, nothing inserted'));
           sessionDone.add(key);
-          rec.log(`${where(category, city, next.subArea)} → ${cards.length} cards, none with a website: nothing inserted`);
+          rec.log(`${where(category, city, subArea)} → ${cards.length} cards, none with a website: nothing inserted`);
           if (zeroWebsiteStreak >= 2) {
             // Probably a broken selector, not two genuinely odd categories: reopen both so they get retried after the fix.
             const ids = zeroWebsiteIds.map(String).filter((x) => /^\d+$/.test(x));
@@ -427,18 +504,20 @@ async function runLoop(rec) {
         const stats = await processCards(cards, ctx, spam, res.selector_version, rec.dry);
         totals.seen += stats.seen; totals.inserted += stats.inserted; totals.dupes += stats.dupes; totals.outOfArea += stats.outOfArea;
 
-        if (next.subArea === 'center' && (res.saturated || cards.length >= CAP_THRESHOLD)) needQuadrants = true;
-        already.add(next.subArea);
-        const remaining = needQuadrants ? SUB_AREAS.filter((s) => !already.has(s)) : [];
+        const isCapped = res.saturated || cards.length >= CAP_THRESHOLD;
+        searched.add(subArea);
+        if (isCapped) capped.add(subArea);
+        const remaining = pendingAreas(roots, searched, capped);
         const finished = remaining.length === 0;
+        const atMax = isCapped && next.zoom >= MAX_ZOOM ? ` at max zoom ${MAX_ZOOM}` : '';
         await logSearch(ctx, stats, finished ? 'done' : 'partial',
-          finished ? `server; closed ${stats.closed}, incomplete ${stats.incomplete}`
-                   : `server; ${next.subArea === 'center' ? `capped at ${stats.seen}` : `${next.subArea} done`} — next sub-area ${remaining[0]}`);
-        rec.log(`${city} | ${category} | ${next.subArea} → seen ${stats.seen}, new ${stats.inserted}, dupes ${stats.dupes}, out ${stats.outOfArea}`);
+          finished ? `server; ${atMax ? `capped at ${stats.seen}${atMax}, ` : ''}closed ${stats.closed}, incomplete ${stats.incomplete}`
+                   : `server; ${isCapped ? `capped at ${stats.seen}${atMax}` : `${subArea} done`} — next sub-area ${remaining[0]}`);
+        rec.log(`${city} | ${category} | ${subArea} (${next.zoom}z) → seen ${stats.seen}, new ${stats.inserted}, dupes ${stats.dupes}, out ${stats.outOfArea}${isCapped ? ', capped' : ''}`);
         if (finished) { sessionDone.add(key); break; }
       }
       if (!didAny) { // every sub-area was already logged but nobody marked it done
-        await logSearch({ city, category, subArea: 'all', zoom: 14 }, { seen: 0, inserted: 0, dupes: 0, outOfArea: 0 }, 'done', 'server; all sub-areas already searched');
+        await logSearch({ city, category, subArea: 'all', zoom: ROOT_ZOOM }, { seen: 0, inserted: 0, dupes: 0, outOfArea: 0 }, 'done', 'server; all sub-areas already searched');
         sessionDone.add(key);
       }
     }

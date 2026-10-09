@@ -69,7 +69,10 @@ function extractCards(sel) {
   const clean = (s) => (s || '').replace(/[-]/g, '').replace(/\s+/g, ' ').trim();
   const phoneRe = /(\+1[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/;
   const hoursRe = /^(open|closed|closes|opens|open 24 hours|temporarily closed|permanently closed)\b/i;
-  const cards = [...document.querySelectorAll(`${sel.feed} ${sel.card}`)];
+  // Match cards inside the feed element: a card selector that itself starts with the feed
+  // (e.g. 'div[role="feed"] > div > div[jsaction]') would never match as `${feed} ${card}`.
+  const feedEl = document.querySelector(sel.feed);
+  const cards = feedEl ? [...feedEl.querySelectorAll(sel.card)] : [];
   return cards.map((c) => {
     const link = c.querySelector(sel.card_link) || c.querySelector('a[href*="/maps/place/"]');
     const href = link ? link.getAttribute('href') || '' : '';
@@ -194,7 +197,10 @@ async function runSearch(page, sel, { category, city, lat, lng, zoom }) {
     await sleep(1500);
   }
   if (await challenged()) return { challenged: true };
-  return { cards: await page.evaluate(extractCards, sel) };
+  const cards = await page.evaluate(extractCards, sel);
+  // No cards but the feed holds place links: the card selectors are broken, don't log it as done.
+  if (!cards.length && (await page.locator(`${sel.feed} a[href*="/maps/place/"]`).count()) > 0) return { feedMissing: true };
+  return { cards };
 }
 
 // ---------- filter, dedupe, insert ----------
@@ -309,7 +315,7 @@ async function main() {
         const res = await runSearch(page, sel, ctx);
         totals.searches++;
         if (res.challenged) { status = 'challenged'; stopReason = `CAPTCHA/unusual-traffic on ${category} ${city} ${next.subArea}`; break outer; }
-        if (res.feedMissing) { status = 'selector_broken'; stopReason = `feed selector did not resolve (${sel.feed}) on ${category} ${city}`; break outer; }
+        if (res.feedMissing) { status = 'selector_broken'; stopReason = `feed or card selectors did not resolve (${sel.feed} / ${sel.card}) on ${category} ${city}`; break outer; }
 
         // Website selector sanity check BEFORE inserting: 10+ cards and zero website buttons
         // means the selector is probably broken, and every card would look like a lead.

@@ -191,6 +191,8 @@ export function buildServerCatalog(env = process.env) {
       XDG_CACHE_HOME: env.MCP_CAMOUFOX_CACHE || '/opt/camoufox-cache',
       ...(env.HARVEST_PROXY ? { HARVEST_PROXY: env.HARVEST_PROXY } : {}),
       ...(env.HARVEST_MAX_CALLS ? { HARVEST_MAX_CALLS: env.HARVEST_MAX_CALLS } : {}),
+      ...(env.HARVEST_BUDGET_WINDOW_S ? { HARVEST_BUDGET_WINDOW_S: env.HARVEST_BUDGET_WINDOW_S } : {}),
+      ...(env.HARVEST_CIRCUIT_RESET_S ? { HARVEST_CIRCUIT_RESET_S: env.HARVEST_CIRCUIT_RESET_S } : {}),
     },
     callTimeoutMs: 3 * 60 * 1000,
   });
