@@ -52,12 +52,19 @@ RUN python3 -m venv /opt/pyenv \
  && XDG_CACHE_HOME=/opt/camoufox-cache /opt/harvestenv/bin/python -m camoufox fetch \
  && chmod -R a+rX /opt/camoufox-cache \
  && rm -rf /tmp/req
+# fetch's readabilipy runs Mozilla Readability through node when its JS deps are present.
+RUN cd "$(/opt/pyenv/bin/python -c 'import readabilipy,os;print(os.path.dirname(readabilipy.__file__))')/javascript" \
+ && npm install --omit=dev --no-audit --no-fund \
+ && rm -rf /root/.npm
 
 WORKDIR /app
 
 # ---- modelcontextprotocol/servers (TypeScript: filesystem, memory, ...) ------
 COPY vendor/servers /app/servers
-RUN cd /app/servers && npm ci --no-audit --no-fund && npm run build
+# NODE_ENV=production would skip devDependencies (tsc), so include them for the
+# build and prune afterwards; --ignore-scripts stops `prepare` building early.
+RUN cd /app/servers && npm ci --include=dev --ignore-scripts --no-audit --no-fund \
+ && npm run build && npm prune --omit=dev --ignore-scripts --no-audit --no-fund
 
 # ---- microsoft/playwright-mcp + Chromium -------------------------------------
 COPY vendor/playwright/package-lock.json /tmp/playwright-lock.json
@@ -70,10 +77,13 @@ RUN cd /tmp && npm pack @playwright/mcp@0.0.80 --silent \
  && rm -f /tmp/playwright-mcp-0.0.80.tgz /tmp/playwright-lock.json
 
 # ---- supabase/mcp ------------------------------------------------------------
+# The npm release's entry point is dist/transports/stdio.js; servers.js starts
+# dist/cli.js (the name in a source build), so add a one-line shim.
 RUN cd /tmp && npm pack @supabase/mcp-server-supabase@0.12.0 --silent \
  && mkdir -p /app/supabase \
  && tar -xzf /tmp/supabase-mcp-server-supabase-0.12.0.tgz -C /app/supabase --strip-components=1 \
  && cd /app/supabase && npm install --omit=dev --ignore-scripts --no-audit --no-fund \
+ && printf '#!/usr/bin/env node\nimport "./transports/stdio.js";\n' > dist/cli.js \
  && rm -f /tmp/supabase-mcp-server-supabase-0.12.0.tgz
 
 # ---- gateway + harvest -------------------------------------------------------
@@ -86,7 +96,7 @@ COPY --from=github-mcp /out/github-mcp-server /app/bin/github-mcp-server
 
 RUN chmod +x /app/entrypoint.sh \
  && mkdir -p /data \
- && chown -R node:node /app /data
+ && chown -R node:node /app /data /opt/pyenv /opt/camoufox-cache /ms-playwright
 
 WORKDIR /app/gateway
 EXPOSE 8080
