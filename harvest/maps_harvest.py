@@ -439,8 +439,13 @@ _JS_EXTRACT_CARDS = r"""
       }
     }
     const RATING_ROW = /^\d[\d.,]*\s*\(/;   // "4.8(204)"
+    const NO_REVIEWS = /^no reviews$/i;      // unreviewed listings show this where the rating goes
     for (const row of rows) {
       const parts = row.split('·').map(s => s.trim()).filter(Boolean);
+      if (parts.length && NO_REVIEWS.test(parts[0])) {
+        if (review_count === null) review_count = 0;
+        parts.shift();
+      }
       if (!parts.length || STATUS.test(parts[0]) || PHONE.test(parts[0]) || RATING_ROW.test(parts[0])) continue;
       category_label = parts[0];
       // Service-area businesses show no address: the row is the category alone.
