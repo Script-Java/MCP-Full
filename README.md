@@ -27,7 +27,8 @@ plus the optional `everything` test server.
 sub-areas first), `harvest_tile` at 13z: the town point, or a 13z grid over the
 town's boundary (Nominatim) for towns bigger than one search. An area with 115+
 cards is split into its four `subdivide_tile` children, again down to
-`TILE_RUN_MAX_ZOOM` (default 15); `sub_area` names the path (`center`, `NW`,
+`TILE_RUN_MAX_ZOOM` (default 15); below 13z only while that search still found
+`TILE_RUN_SPLIT_MIN_NEW` (default 1) new leads; `sub_area` names the path (`center`, `NW`,
 `NW-NE`, `g3`, `g3-SW`). New no-website leads go into
 `"no-Website-lead"`, one `harvest_runs` row per run (`runner = 'server'`).
 `gateway__tile_run_status` reports progress; logs go to `/data/tile-runs/`.

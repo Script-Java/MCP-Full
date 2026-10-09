@@ -37,6 +37,12 @@ const CAP_THRESHOLD = 115;
 const ROOT_ZOOM = 13;
 // Capped sub-areas are split again down to this zoom (13 centre, 14 quadrants, 15, ...).
 const MAX_ZOOM = Math.min(Math.max(Number(process.env.TILE_RUN_MAX_ZOOM || 15), 14), 17);
+// Below the 13z roots, a capped area is only split when its own search still found this many
+// new leads: deep splits in well-harvested areas cost searches for almost no leads.
+const SPLIT_MIN_NEW = Math.max(Number(process.env.TILE_RUN_SPLIT_MIN_NEW ?? 1), 0);
+
+/** Should a capped area be split into its four children? */
+export const splitWorthIt = (path, newLeads, minNew = SPLIT_MIN_NEW) => areaZoom(path) === ROOT_ZOOM || Number(newLeads) >= minNew;
 const TX_BOX = { minLat: 25.83, maxLat: 36.51, minLng: -106.65, maxLng: -93.5 };
 const SOCIAL_HOSTS = /(^|\.)(facebook\.com|fb\.com|fb\.me|instagram\.com|linktr\.ee)$/i;
 const INSERT_COLS = ['name', 'category', 'address', 'phone', 'city', 'rating', 'review_count', 'google_maps_url',
@@ -191,7 +197,8 @@ export function pendingAreas(roots, searched, capped, maxZoom = MAX_ZOOM) {
 /**
  * What to search next (reference nextWork, minus the geocoding): a city+category with areas
  * already searched but no 'done' row comes first, then towns by priority x CATEGORIES.
- * An area counts as capped when it saw CAP_THRESHOLD+ cards or any of its children was searched.
+ * An area is split ('capped' here) when it saw CAP_THRESHOLD+ cards and splitWorthIt, or when
+ * any of its children was already searched.
  */
 export function planWork(logRows, towns, sessionDone) {
   const sample = logRows.find((r) => r.city);
@@ -204,7 +211,7 @@ export function planWork(logRows, towns, sessionDone) {
     if (r.status === 'done') e.done = true;
     for (const p of parseSubArea(r.sub_area)) {
       e.searched.add(p);
-      if (Number(r.cards_seen) >= CAP_THRESHOLD) e.capped.add(p);
+      if (Number(r.cards_seen) >= CAP_THRESHOLD && splitWorthIt(p, r.inserted)) e.capped.add(p);
     }
   }
   for (const e of byKey.values()) {
@@ -415,7 +422,7 @@ async function runLoop(rec) {
     outer: while (totals.searches < rec.maxSearches) {
       if (rec.stopRequested) break;
       if (minutes() > MAX_MINUTES) { stopReason = 'time cap'; break; }
-      const work = planWork(await sql('select city, category, status, sub_area, cards_seen from search_log'),
+      const work = planWork(await sql('select city, category, status, sub_area, cards_seen, inserted from search_log'),
         await sql('select * from harvest_towns where not skip order by priority'), sessionDone);
       if (!work) { stopReason = 'town list exhausted — add towns to harvest_towns'; break; }
       const { key, town, city, category, searched, capped } = work;
@@ -506,14 +513,15 @@ async function runLoop(rec) {
 
         const isCapped = res.saturated || cards.length >= CAP_THRESHOLD;
         searched.add(subArea);
-        if (isCapped) capped.add(subArea);
+        const split = isCapped && splitWorthIt(subArea, stats.inserted);
+        if (split) capped.add(subArea);
         const remaining = pendingAreas(roots, searched, capped);
         const finished = remaining.length === 0;
-        const atMax = isCapped && next.zoom >= MAX_ZOOM ? ` at max zoom ${MAX_ZOOM}` : '';
+        const atMax = !isCapped ? '' : next.zoom >= MAX_ZOOM ? ` at max zoom ${MAX_ZOOM}` : split ? '' : ', no new leads: not split';
         await logSearch(ctx, stats, finished ? 'done' : 'partial',
           finished ? `server; ${atMax ? `capped at ${stats.seen}${atMax}, ` : ''}closed ${stats.closed}, incomplete ${stats.incomplete}`
                    : `server; ${isCapped ? `capped at ${stats.seen}${atMax}` : `${subArea} done`} — next sub-area ${remaining[0]}`);
-        rec.log(`${city} | ${category} | ${subArea} (${next.zoom}z) → seen ${stats.seen}, new ${stats.inserted}, dupes ${stats.dupes}, out ${stats.outOfArea}${isCapped ? ', capped' : ''}`);
+        rec.log(`${city} | ${category} | ${subArea} (${next.zoom}z) → seen ${stats.seen}, new ${stats.inserted}, dupes ${stats.dupes}, out ${stats.outOfArea}${split ? ', capped: split' : isCapped ? ', capped: not split' : ''}`);
         if (finished) { sessionDone.add(key); break; }
       }
       if (!didAny) { // every sub-area was already logged but nobody marked it done

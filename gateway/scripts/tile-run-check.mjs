@@ -98,11 +98,18 @@ assert.deepEqual(T.pendingAreas(['g0', 'g1'], new Set(['g0']), new Set()), ['g1'
 // Capped from cards_seen (a 14z quadrant with 120 cards gets split again on resume).
 w = T.planWork([
   { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'center', cards_seen: 119 },
-  { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'NW', cards_seen: 120 },
+  { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'NW', cards_seen: 120, inserted: 2 },
   { city: 'Frisco', category: 'lawn care service', status: 'partial', sub_area: 'NE', cards_seen: 80 },
 ], [{ city: 'Frisco', priority: 100, lat: 33.15, lng: -96.82 }], new Set());
 assert.deepEqual([...w.capped].sort(), ['NW', 'center']);
 assert.deepEqual(T.pendingAreas(['center'], w.searched, w.capped, 15), ['NW-NW', 'NW-NE', 'NW-SW', 'NW-SE', 'SW', 'SE']);
+// Below 13z a capped area with no new leads is not split; a 13z root always is.
+w = T.planWork([
+  { city: 'Frisco', category: 'tree service', status: 'partial', sub_area: 'center', cards_seen: 120, inserted: 0 },
+  { city: 'Frisco', category: 'tree service', status: 'partial', sub_area: 'NW', cards_seen: 120, inserted: 0 },
+], [{ city: 'Frisco', priority: 100, lat: 33.15, lng: -96.82 }], new Set());
+assert.deepEqual([...w.capped], ['center']);
+assert.deepEqual([T.splitWorthIt('center', 0), T.splitWorthIt('g2', 0), T.splitWorthIt('NW', 0), T.splitWorthIt('NW', 1), T.splitWorthIt('g2-SE', 3, 5)], [true, true, false, true, false]);
 const allAubrey = new Set(T.CATEGORIES.map((c) => `aubrey|${c}`));
 assert.equal(T.planWork([], towns, allAubrey).town.city, 'Denton');
 assert.equal(T.CATEGORIES.length, 24);
@@ -134,7 +141,10 @@ const rowsFor = (q) => {
   if (/from active_selectors/.test(q) && db.selectorsDown) throw new Error('connection refused');
   if (/from active_selectors/.test(q)) return [{ version: '2026-09-14.1', selectors: { feed: 'div[role="feed"]', website_btn: 'a[data-value="Website"]' } }];
   if (/from spam_coords/.test(q)) return spam;
-  if (/from search_log$/.test(q)) return db.log;
+  if (/from search_log$/.test(q)) { // only the selected columns, like Postgres
+    const cols = q.match(/^select (.*) from search_log$/)[1].split(',').map((c) => c.trim());
+    return db.log.map((r) => Object.fromEntries(cols.map((c) => [c, r[c] ?? null])));
+  }
   if (/from harvest_towns/.test(q)) return db.towns;
   if (/^insert into search_log/.test(q)) return [{ id: db.nextId++ }];
   if (/ as p10 from /.test(q)) return db.existingPhones.filter((p) => q.includes(`'${p}'`)).map((p10) => ({ p10 }));
@@ -300,6 +310,27 @@ const notes6 = db.queries.filter((q) => q.startsWith('insert into search_log'));
 assert.match(notes6[2], /'partial','server; capped at 116 at max zoom 15 — next sub-area NW-NE'/);
 assert.match(notes6[8], /'done','server; closed 0, incomplete 0'/);
 assert.deepEqual([s6.searches, s6.status], [10, 'challenged']); // then on to the next category
+
+// Run 6b: a capped 14z quadrant that found no new leads is not split.
+db.towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95, skip: false }];
+db.log = [{ city: 'Aubrey', category: 'plumber', status: 'partial', sub_area: 'center', cards_seen: 120, inserted: 3 }];
+const known = many(116, 70000);
+db.existingPhones = known.results.filter((c) => !c.has_website).map((c) => c.phone.slice(-10));
+tiles = [known, { error: 'challenge_detected', selector_version: sv }];
+db.queries.length = 0;
+await runToEnd(5);
+assert.match(db.queries.find((q) => q.startsWith('insert into search_log')), /'NW','14','116','0','58','0','partial','server; capped at 116, no new leads: not split — next sub-area NE'/);
+db.existingPhones = ['2145550199'];
+
+// Run 6c: resuming, a capped NW quadrant that found new leads (read back from search_log) is split.
+db.log = [
+  { city: 'Aubrey', category: 'plumber', status: 'partial', sub_area: 'center', cards_seen: 120, inserted: 3 },
+  { city: 'Aubrey', category: 'plumber', status: 'partial', sub_area: 'NW', cards_seen: 120, inserted: 2 },
+];
+tiles = [many(3, 80000)];
+db.queries.length = 0;
+await runToEnd(1);
+assert.match(db.queries.find((q) => q.startsWith('insert into search_log')), /'Aubrey','plumber','NW-NW','15'/);
 
 // Run 7: a city+category already under way keeps its scheme, even in a town with a big boundary.
 db.towns = [{ city: 'Big Town', priority: 5, lat: 32.8, lng: -96.75, skip: false }];
