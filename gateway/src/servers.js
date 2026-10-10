@@ -193,6 +193,7 @@ export function buildServerCatalog(env = process.env) {
       ...(env.HARVEST_MAX_CALLS ? { HARVEST_MAX_CALLS: env.HARVEST_MAX_CALLS } : {}),
       ...(env.HARVEST_BUDGET_WINDOW_S ? { HARVEST_BUDGET_WINDOW_S: env.HARVEST_BUDGET_WINDOW_S } : {}),
       ...(env.HARVEST_CIRCUIT_RESET_S ? { HARVEST_CIRCUIT_RESET_S: env.HARVEST_CIRCUIT_RESET_S } : {}),
+      ...(env.HARVEST_TIMEOUT_S ? { HARVEST_TIMEOUT_S: env.HARVEST_TIMEOUT_S } : {}),
     },
     callTimeoutMs: 3 * 60 * 1000,
   });
