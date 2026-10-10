@@ -1,0 +1,3 @@
+# LF everywhere: these files run in a Linux container (a CRLF entrypoint.sh fails).
+* text=auto eol=lf
+*.bat text eol=crlf
