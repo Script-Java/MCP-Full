@@ -148,3 +148,64 @@ language sql stable as $$
         order by new_lead_pct nulls first limit 25) y)
   );
 $$;
+
+-- 6. Lead scorer v1 (gateway/src/scorer.js). Adds columns only; existing rows stay as they are
+--    until score_leads scores them (rows with city IS NULL are never scored).
+alter table "no-Website-lead"
+  add column if not exists score            int,
+  add column if not exists tier             text check (tier in ('qualified', 'review', 'rejected')),
+  add column if not exists score_breakdown  jsonb,
+  add column if not exists reject_reason    text,
+  add column if not exists scored_at        timestamptz,
+  add column if not exists scorer_version   text,
+  -- Maps listing signals (harvest card + check_operating), so scoring never browses
+  add column if not exists closed_status      text check (closed_status in ('permanent', 'temporary')),
+  add column if not exists newest_review_date date,
+  add column if not exists hours_present      boolean,
+  add column if not exists photo_count        int,          -- all listing photos: Maps' panel has no owner/customer split
+  add column if not exists signals_at         timestamptz,  -- when check_operating last filled the fields above
+  -- US Census batch geocoder
+  add column if not exists geo_match        text check (geo_match in ('exact', 'non_exact', 'no_match')),
+  add column if not exists geo_lat          double precision,
+  add column if not exists geo_lng          double precision,
+  add column if not exists geo_county_fips  text,
+  add column if not exists geocoded_at      timestamptz,
+  -- same phone_e164 as an older row (that row's source_id)
+  add column if not exists duplicate_of     text;
+-- website_class gains a third value: 'website' (check_operating found a real website later).
+
+create index if not exists no_website_lead_tier_idx on "no-Website-lead" (tier) where city is not null;
+create index if not exists no_website_lead_phone_e164_idx on "no-Website-lead" (phone_e164);
+
+-- 7. Route harvested leads by scorer tier (was: heuristics on review_count / social link / name).
+--    The Qualifier only gets tier 'review' (via agent_review_queue, now with the score breakdown);
+--    'qualified' and 'rejected' are decided by the scorer. Unscored rows stay 'harvested'.
+create or replace function public.promote_to_review() returns json
+language plpgsql as $$
+declare n_review int; n_qualified int; n_rejected int; n_unscored int; n_waiting int;
+begin
+  with upd as (
+    update public."no-Website-lead" t
+       set state = case t.tier when 'review' then 'needs_review' when 'qualified' then 'qualified' else 'rejected' end,
+           review_reason = 'scorer ' || t.scorer_version || ': ' ||
+             case when t.tier = 'rejected' then coalesce(t.reject_reason, 'low_score') || ' (' || t.score || ')' else 'score ' || t.score end
+     where t.state = 'harvested' and t.city is not null and t.tier is not null
+    returning t.state
+  )
+  select count(*) filter (where state = 'needs_review'), count(*) filter (where state = 'qualified'),
+         count(*) filter (where state = 'rejected')
+    into n_review, n_qualified, n_rejected from upd;
+  select count(*) into n_unscored from public."no-Website-lead" where state = 'harvested' and city is not null and tier is null;
+  select count(*) into n_waiting from public."no-Website-lead" where state = 'needs_review';
+  return json_build_object('newly_needs_review', n_review, 'newly_qualified', n_qualified, 'newly_rejected', n_rejected,
+                           'harvested_not_scored_yet', n_unscored, 'needs_review_waiting', n_waiting);
+end
+$$;
+
+create or replace view agent_review_queue as
+select source_id, name, category, address, phone, rating, review_count, google_maps_url, website_class,
+       social_or_notes, city, review_reason, first_seen, score, tier, score_breakdown
+from "no-Website-lead"
+where state = 'needs_review' and tier = 'review'
+order by score desc, first_seen
+limit 200;

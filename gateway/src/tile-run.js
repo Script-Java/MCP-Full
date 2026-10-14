@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { leadRunActive } from './local-tools.js';
+import { enrichLeads, scoreLeads } from './scorer.js';
 
 const DATA_DIR = process.env.MCP_DATA_DIR || '/data';
 const RUN_DIR = path.join(DATA_DIR, 'tile-runs');
@@ -54,7 +55,7 @@ export const splitWorthIt = (path, newLeads, minNew = SPLIT_MIN_NEW) => areaZoom
 const TX_BOX = { minLat: 25.83, maxLat: 36.51, minLng: -106.65, maxLng: -93.5 };
 const SOCIAL_HOSTS = /(^|\.)(facebook\.com|fb\.com|fb\.me|instagram\.com|linktr\.ee)$/i;
 const INSERT_COLS = ['name', 'category', 'address', 'phone', 'city', 'rating', 'review_count', 'google_maps_url',
-  'source_id', 'zip', 'name_norm', 'phone_e164', 'website_class', 'social_or_notes', 'found_on', 'state', 'selector_version'];
+  'source_id', 'zip', 'name_norm', 'phone_e164', 'website_class', 'social_or_notes', 'found_on', 'state', 'selector_version', 'hours_present'];
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }] });
 const fail = (msg) => ({ isError: true, content: [{ type: 'text', text: msg }] });
@@ -139,7 +140,7 @@ export function filterCards(cards, spam) {
     cand.push({
       name: c.name, category: c.category_label ?? null, address: c.address_line ?? null, phone: c.phone ?? null,
       rating: c.rating ?? null, reviews: c.review_count ?? null, sourceId, p10, nn: nameNorm(c.name),
-      social, webHref: social ? web.href || web.host : null,
+      social, webHref: social ? web.href || web.host : null, hours: c.hours_present ?? null,
     });
   }
   return { stats, cand };
@@ -155,7 +156,7 @@ export function buildInserts(fresh, ctx, selectorVersion) {
       (c.address || '').match(/\b(7[5-9]\d{3})\b/)?.[1] || null,
       c.nn, c.p10 ? `+1${c.p10}` : null,
       c.social ? 'social_only' : 'none', c.social ? c.webHref : null,
-      `${ctx.category} @${ctx.lat},${ctx.lng},${ctx.zoom}z`, 'harvested', selectorVersion,
+      `${ctx.category} @${ctx.lat},${ctx.lng},${ctx.zoom}z`, 'harvested', selectorVersion, c.hours,
     ].map(lit).join(',')})`);
     out.push(`insert into ${TABLE} (${INSERT_COLS.join(',')}) values ${values.join(',')} on conflict (source_id) do nothing returning source_id`);
   }
@@ -295,12 +296,17 @@ async function callJson(up, name, args) {
 }
 
 // supabase execute_sql answers {"result": "...<untrusted-data-ID>\n[rows]\n</untrusted-data-ID>"}.
-async function sql(query) {
+export async function sql(query) {
   const r = await callJson(deps.supabase, 'execute_sql', { query });
   const body = r.result ?? r.raw ?? '';
   const m = body.match(/<untrusted-data-([\w-]+)>\n([\s\S]*?)\n<\/untrusted-data-\1>/);
   if (!m) throw new Error(`sql failed: ${(body || JSON.stringify(r)).slice(0, 300)}`);
   return JSON.parse(m[2]);
+}
+
+/** One harvest tool call, parsed (scorer.js enrichment). */
+export function callHarvest(name, args) {
+  return callJson(deps.harvest, name, args);
 }
 
 let lastGeocode = 0;
@@ -571,12 +577,29 @@ async function runLoop(rec) {
     stopReason = String(err?.message || err).slice(0, 500);
   } finally {
     if (rec.stopRequested) { status = 'stopped'; stopReason = rec.stopRequested; }
+    if (!rec.dry && !rec.stopRequested) await scoreAfterRun(rec, status);
     rec.status = status;
     rec.stopReason = stopReason;
     rec.running = false;
     rec.finished = Date.now();
     await finishRow(rec).catch((err) => rec.log(`harvest_runs update failed: ${err?.message ?? err}`));
     rec.log('done', JSON.stringify(summary(rec)));
+  }
+}
+
+/** End of a run: Maps signals for new leads (only if Maps is healthy), then score_leads. Still counts as running. */
+async function scoreAfterRun(rec, status) {
+  try {
+    if (status === 'ok') {
+      const e = await enrichLeads(undefined, (m) => rec.log(m));
+      rec.totals.enriched = e.enriched;
+      rec.log(`enriched ${e.enriched} leads with listing signals${e.stopped ? ` (stopped: ${e.stopped})` : ''}`);
+    }
+    const s = await scoreLeads({ limit: 500 }, (m) => rec.log(m));
+    rec.totals.scored = s.scored;
+    rec.log(`scored ${JSON.stringify(s)}`);
+  } catch (err) {
+    rec.log(`scoring failed: ${err?.message ?? err}`);
   }
 }
 
@@ -613,7 +636,7 @@ function finishRow(rec) {
 const summary = (rec) => ({
   dry_run: Boolean(rec.dry), status: rec.status, stop_reason: rec.stopReason, harvest_run_id: rec.harvestRunId, selector_version: rec.selectorVersion,
   searches: rec.totals.searches, cards_seen: rec.totals.seen, inserted: rec.totals.inserted,
-  duplicates: rec.totals.dupes, out_of_area: rec.totals.outOfArea,
+  duplicates: rec.totals.dupes, out_of_area: rec.totals.outOfArea, enriched: rec.totals.enriched ?? 0, scored: rec.totals.scored ?? 0,
 });
 
 export function tileRunStatus(args) {

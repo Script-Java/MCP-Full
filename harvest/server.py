@@ -79,7 +79,9 @@ async def harvest_tile(category: str, lat: float, lng: float, zoom: int, limit: 
     `subdivide_tile` and harvest the four children. `truncated: true` means
     `limit` was reached before the end of the feed. `limit` defaults to 50
     and is capped at 120 server-side. extended=true adds lat, lng (the pin,
-    null if unknown) and closed (permanently/temporarily closed) per card.
+    null if unknown), closed (permanently/temporarily closed), closed_status
+    ("permanent", "temporary" or null) and hours_present (the card shows an
+    open/closed status line) per card.
 
     Errors: {"error": "challenge_detected"} (stop; retry_after_s given),
     {"error": "selectors_stale"}, {"error": "timeout"} (may carry
@@ -108,10 +110,12 @@ async def listing_detail(maps_url: str) -> str:
 
 @mcp.tool(structured_output=False)
 async def check_operating(maps_url: str) -> str:
-    """Cheap liveness check for an ambiguous listing.
+    """Liveness and lead-quality signals for one listing (page load + reviews tab).
 
     Returns {selector_version, name, maps_cid, permanently_closed,
-    temporarily_closed, most_recent_review_date (approximate ISO date),
+    temporarily_closed, closed_status, website_url, phone, address (full, with city
+    and zip), hours_present,
+    photo_count (all listing photos), most_recent_review_date (approximate ISO date),
     most_recent_review_relative, review_count, reviews_sampled,
     reviews_sorted_newest, owner_responds, owner_response_count}.
 

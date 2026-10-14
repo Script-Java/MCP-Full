@@ -55,8 +55,8 @@ assert.equal(f.cand[3].p10, null);
 
 // ---- insert SQL ----
 const [ins] = T.buildInserts([f.cand[0], f.cand[1]], { city: 'Aubrey, TX', category: 'plumber', lat: 33.3, lng: -96.95, zoom: 13 }, '2026-09-14.1');
-assert.match(ins, /^insert into public\."no-Website-lead" \(name,category,address,phone,city,rating,review_count,google_maps_url,source_id,zip,name_norm,phone_e164,website_class,social_or_notes,found_on,state,selector_version\) values /);
-assert.match(ins, /'Good Plumbing','Plumber','1 Main St','\(214\) 555-0101','Aubrey, TX','4.8','12','https:\/\/www\.google\.com\/maps\?cid=111','111',NULL,'good plumbing','\+12145550101','none',NULL,'plumber @33\.3,-96\.95,13z','harvested','2026-09-14\.1'\)/);
+assert.match(ins, /^insert into public\."no-Website-lead" \(name,category,address,phone,city,rating,review_count,google_maps_url,source_id,zip,name_norm,phone_e164,website_class,social_or_notes,found_on,state,selector_version,hours_present\) values /);
+assert.match(ins, /'Good Plumbing','Plumber','1 Main St','\(214\) 555-0101','Aubrey, TX','4.8','12','https:\/\/www\.google\.com\/maps\?cid=111','111',NULL,'good plumbing','\+12145550101','none',NULL,'plumber @33\.3,-96\.95,13z','harvested','2026-09-14\.1',NULL\)/);
 assert.match(ins, /'social_only','https:\/\/www\.facebook\.com\/socialco'/);
 assert.match(ins, /on conflict \(source_id\) do nothing returning source_id$/);
 assert.equal(T.buildInserts(Array(120).fill(f.cand[0]), { city: 'X', category: 'c', lat: 1, lng: 2, zoom: 13 }, 'v').length, 3); // 50 per statement

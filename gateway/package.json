@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "libphonenumber-js": "1.12.9",
     "zod": "^3.25.0"
   }
 }

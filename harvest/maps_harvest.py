@@ -89,6 +89,7 @@ SELECTORS: dict[str, str] = {
     "detail_claim_text": r"claim this business|own this business",
     "detail_closed_text": r"permanently closed",
     "detail_temp_closed_text": r"temporarily closed",
+    "detail_photos_text": r"^([\d,]+)\s+photos?$",   # the "54 Photos" button on the panel
     # -- reviews (check_operating) -------------------------------------------
     "reviews_tab": 'button[role="tab"][aria-label*="Reviews" i]',
     "reviews_sort_button": 'button[aria-label="Sort reviews"], button[data-value="Sort"]',
@@ -468,7 +469,7 @@ _JS_EXTRACT_CARDS = r"""
     }
     const text = clean(card.innerText);
 
-    let category_label = null, address_line = null;
+    let category_label = null, address_line = null, hours_present = false;
     const rows = new Set();
     for (const el of card.querySelectorAll(S.card_meta_row)) {
       for (const line of (el.innerText || '').split('\n')) {
@@ -488,6 +489,7 @@ _JS_EXTRACT_CARDS = r"""
       if (/m/i.test(m[2])) n *= 1e6;
       if (!Number.isNaN(n)) review_count = Math.round(n);
     };
+    for (const row of rows) if (row.split('·').some(p => /^(open|closes|opens|closed)\b/i.test(p.trim()))) hours_present = true;
     for (const row of rows) {
       const parts = row.split('·').map(s => s.trim()).filter(Boolean);
       // Rating / review-count pieces that stand alone are not the category.
@@ -524,6 +526,8 @@ _JS_EXTRACT_CARDS = r"""
       lat: ll ? Number(ll[1]) : null,
       lng: ll ? Number(ll[2]) : null,
       closed: /(^|\n)\s*(permanently|temporarily) closed/i.test(text),
+      closed_status: /(^|\n)\s*permanently closed/i.test(text) ? 'permanent' : /(^|\n)\s*temporarily closed/i.test(text) ? 'temporary' : null,
+      hours_present,
     });
   }
   return out;
@@ -577,6 +581,13 @@ _JS_EXTRACT_DETAIL = r"""
     if (hb) hours = attr(hb, 'aria-label');
   }
 
+  let photo_count = null;
+  const photosRe = new RegExp(S.detail_photos_text, 'i');
+  for (const b of main.querySelectorAll('button')) {
+    const m = clean(b.innerText).match(photosRe);
+    if (m) { photo_count = parseInt(m[1].replace(/,/g, ''), 10); break; }
+  }
+
   let rating = null, review_count = null;
   const rEl = q(S.detail_rating);
   if (rEl) { const v = parseFloat((rEl.innerText || '').replace(',', '.')); if (!Number.isNaN(v)) rating = v; }
@@ -590,6 +601,7 @@ _JS_EXTRACT_DETAIL = r"""
     address,
     category_label: catBtn ? (clean(catBtn.innerText) || null) : null,
     hours,
+    photo_count,
     rating,
     review_count,
     claim_present: !!q(S.detail_claim) || new RegExp(S.detail_claim_text, 'i').test(text),
@@ -777,10 +789,16 @@ def _card_from_detail(d: dict, url: str) -> dict:
         "lat": float(ll.group(1)) if ll else None,
         "lng": float(ll.group(2)) if ll else None,
         "closed": bool(d.get("permanently_closed") or d.get("temporarily_closed")),
+        "closed_status": _closed_status(d),
+        "hours_present": bool(d.get("hours")),
     }
 
 
-_EXTENDED_FIELDS = ("lat", "lng", "closed")
+def _closed_status(d: dict) -> Optional[str]:
+    return "permanent" if d.get("permanently_closed") else "temporary" if d.get("temporarily_closed") else None
+
+
+_EXTENDED_FIELDS = ("lat", "lng", "closed", "closed_status", "hours_present")
 
 
 def _strip_extended(cards: list) -> list:
@@ -962,6 +980,13 @@ async def check_operating(maps_url: str) -> dict:
                 "maps_cid": cid,
                 "permanently_closed": bool(d.get("permanently_closed")),
                 "temporarily_closed": bool(d.get("temporarily_closed")),
+                "closed_status": _closed_status(d),
+                "website_url": d.get("website_url"),
+                "phone": d.get("phone"),
+                "address": d.get("address"),
+                "hours_present": bool(d.get("hours")),
+                # All listing photos: the panel does not split owner from customer photos.
+                "photo_count": d.get("photo_count"),
                 "most_recent_review_date": _relative_to_iso(newest),
                 "most_recent_review_relative": newest,
                 "review_count": d.get("review_count"),

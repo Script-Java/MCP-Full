@@ -22,6 +22,7 @@ import { buildServerCatalog } from './servers.js';
 import { Upstream } from './upstream.js';
 import { createDownstreamServer } from './downstream.js';
 import { initTileRuns, stopTileRuns } from './tile-run.js';
+import { initScorer } from './scorer.js';
 
 const VERSION = '1.1.0';
 const PORT = Number(process.env.PORT || 8080);
@@ -77,6 +78,8 @@ await Promise.allSettled(upstreams.map((u) => u.connect()));
 await Promise.allSettled(upstreams.filter((u) => u.status === 'up').map((u) => u.listTools()));
 // Server-side Maps tile runs (start_tile_run, TILE_RUN_CRON, active_selectors copy).
 initTileRuns({ harvest: byName.get('harvest'), supabase: byName.get('supabase'), log });
+// Lead scorer: nightly Comptroller permit download (score_leads itself is a tool + end of tile runs).
+initScorer({ supabase: byName.get('supabase'), log });
 
 // ---------------------------------------------------------------------------
 // Sessions
