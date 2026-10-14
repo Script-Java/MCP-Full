@@ -353,6 +353,42 @@ assert.deepEqual(harvestCalls.filter(([n]) => n === 'harvest_tile').slice(0, 4).
 assert.equal(s8.status, 'challenged');
 assert.equal(fetched.filter((u) => u.includes('Big%20Town')).length, 1, 'boundary looked up once per process');
 
+// Timeouts: 'error' rows are failures, not searched; FAIL_LIMIT (2) of them split the area, or skip it at max zoom.
+const fr = (sub_area) => ({ city: 'Aubrey', category: 'plumber', status: 'error', sub_area, cards_seen: 40 });
+w = T.planWork([fr('center')], towns, new Set());
+assert.deepEqual([w.category, w.searched.size, w.failed.get('center')], ['plumber', 0, 1]);
+assert.deepEqual(T.pendingAreas(['center'], w.searched, w.capped), ['center'], 'one timeout: retried');
+w = T.planWork([fr('center'), fr('center')], towns, new Set());
+assert.deepEqual(T.pendingAreas(['center'], w.searched, w.capped), ['NW', 'NE', 'SW', 'SE'], 'two timeouts: split');
+const doneRow = (sub_area) => ({ city: 'Aubrey', category: 'plumber', status: 'partial', sub_area, cards_seen: 120, inserted: 5 });
+w = T.planWork([doneRow('center'), doneRow('NW'), fr('NW-NW'), fr('NW-NW')], towns, new Set());
+assert.deepEqual(T.pendingAreas(['center'], w.searched, w.capped, 15).slice(0, 2), ['NW-NE', 'NW-SW'], 'two timeouts at max zoom: skipped');
+
+// Run 9: a timeout saves its partial cards, logs an 'error' row and moves on to the next category.
+db.towns = [{ city: 'Aubrey', priority: 10, lat: 33.3, lng: -96.95, skip: false }];
+db.log = [];
+tiles = [
+  { error: 'timeout', timeout_s: 90, partial_results: [card({ name: 'Partial Co', maps_cid: '91', phone: '2145550191' })] },
+  quiet(5, 'Next Co'),
+  { error: 'challenge_detected', selector_version: sv },
+];
+db.queries.length = 0;
+const s9 = await runToEnd(10);
+assert.deepEqual([s9.status, s9.searches, s9.inserted], ['challenged', 3, 2]);
+const logged9 = db.queries.filter((q) => q.startsWith('insert into search_log'));
+assert.match(logged9[0], /'Aubrey','plumber','center','13','1','1','0','0','error','server; timeout after 90s \(failure 1\), 1 partial cards saved — retried next run'/);
+assert.match(logged9[1], /'Aubrey','hvac contractor','center','13',.*'done'/);
+assert.ok(db.queries.some((q) => q.startsWith('insert into public."no-Website-lead"') && q.includes("'Partial Co'")));
+
+// Run 10: three timeouts in a row stop the run (degraded browser), each one still saved and logged.
+const timeout = { error: 'timeout', timeout_s: 90, partial_results: [] };
+tiles = [timeout, timeout, timeout, quiet(6, 'Never')];
+db.queries.length = 0;
+const s10 = await runToEnd(10);
+assert.deepEqual([s10.status, s10.searches], ['error', 3]);
+assert.match(s10.stop_reason, /timed out on 3 searches in a row/);
+assert.equal(db.queries.filter((q) => q.startsWith('insert into search_log') && q.includes("'error'")).length, 3);
+
 await T.stopTileRuns('test over');
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('tile-run ok');

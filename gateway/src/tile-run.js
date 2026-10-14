@@ -44,6 +44,10 @@ const MAX_ZOOM = Math.min(Math.max(Number(process.env.TILE_RUN_MAX_ZOOM || 15), 
 // Below the 13z roots, a capped area is only split when its own search still found this many
 // new leads: deep splits in well-harvested areas cost searches for almost no leads.
 const SPLIT_MIN_NEW = Math.max(Number(process.env.TILE_RUN_SPLIT_MIN_NEW ?? 1), 0);
+// harvest_tile timeouts: an area that timed out this many times is split (or skipped at max zoom);
+// this many timeouts in a row stops the run (the browser is probably degraded, not the areas).
+const FAIL_LIMIT = 2;
+const TIMEOUT_STREAK_STOP = 3;
 
 /** Should a capped area be split into its four children? */
 export const splitWorthIt = (path, newLeads, minNew = SPLIT_MIN_NEW) => areaZoom(path) === ROOT_ZOOM || Number(newLeads) >= minNew;
@@ -210,15 +214,22 @@ export function planWork(logRows, towns, sessionDone) {
   const byKey = new Map();
   for (const r of logRows) {
     const k = `${norm(r.city)}|${(r.category || '').toLowerCase()}`;
-    if (!byKey.has(k)) byKey.set(k, { done: false, searched: new Set(), capped: new Set() });
+    if (!byKey.has(k)) byKey.set(k, { done: false, searched: new Set(), capped: new Set(), failed: new Map() });
     const e = byKey.get(k);
     if (r.status === 'done') e.done = true;
     for (const p of parseSubArea(r.sub_area)) {
+      if (r.status === 'error') { e.failed.set(p, (e.failed.get(p) ?? 0) + 1); continue; }
       e.searched.add(p);
       if (Number(r.cards_seen) >= CAP_THRESHOLD && splitWorthIt(p, r.inserted)) e.capped.add(p);
     }
   }
   for (const e of byKey.values()) {
+    // FAIL_LIMIT timeouts on one area: split it (its children are smaller searches), or skip it at max zoom.
+    for (const [p, n] of e.failed) {
+      if (n < FAIL_LIMIT || e.searched.has(p)) continue;
+      e.searched.add(p);
+      if (areaZoom(p) < MAX_ZOOM) e.capped.add(p);
+    }
     for (const p of e.searched) for (let q = parentArea(p); q; q = parentArea(q)) e.capped.add(q);
   }
   for (const partialOnly of [true, false]) {
@@ -226,9 +237,9 @@ export function planWork(logRows, towns, sessionDone) {
       for (const cat of CATEGORIES) {
         const key = `${norm(t.city)}|${cat}`;
         const e = byKey.get(key);
-        if (e?.done || sessionDone.has(key) || (partialOnly && !e?.searched.size)) continue;
+        if (e?.done || sessionDone.has(key) || (partialOnly && !e?.searched.size && !e?.failed.size)) continue;
         return { key, town: t, city: cityLabel(t.city), category: cat,
-          searched: e ? e.searched : new Set(), capped: e ? e.capped : new Set() };
+          searched: e ? e.searched : new Set(), capped: e ? e.capped : new Set(), failed: e ? e.failed : new Map() };
       }
     }
   }
@@ -414,6 +425,7 @@ async function runLoop(rec) {
     const spam = await sql('select lat, lng from spam_coords');
     const sessionDone = new Set();
     let zeroWebsiteStreak = 0;
+    let timeoutStreak = 0;
     const zeroWebsiteIds = [];
 
     const logSearch = async (ctx, stats, st, notes) => {
@@ -429,7 +441,7 @@ async function runLoop(rec) {
       const work = planWork(await sql('select city, category, status, sub_area, cards_seen, inserted from search_log'),
         await sql('select * from harvest_towns where not skip order by priority'), sessionDone);
       if (!work) { stopReason = 'town list exhausted — add towns to harvest_towns'; break; }
-      const { key, town, city, category, searched, capped } = work;
+      const { key, town, city, category, searched, capped, failed } = work;
       if (town.lat == null || town.lng == null) {
         const g = await geoFor(town.city);
         if (!g.saved && !rec.dry) {
@@ -477,7 +489,9 @@ async function runLoop(rec) {
           { category: searchText(category), lat: next.lat, lng: next.lng, zoom: next.zoom, limit: 120, extended: true });
         totals.searches++;
         if (res.selector_version) rec.selectorVersion = res.selector_version;
-        if (res.error || !Array.isArray(res.results)) {
+        const timedOut = res.error === 'timeout';
+        timeoutStreak = timedOut ? timeoutStreak + 1 : 0;
+        if ((res.error && !timedOut) || (!timedOut && !Array.isArray(res.results))) {
           const code = res.error ?? 'internal';
           const at = where(category, city, subArea);
           if (code === 'challenge_detected') { status = 'challenged'; stopReason = `${code} on ${at}`; }
@@ -488,7 +502,8 @@ async function runLoop(rec) {
           rec.log(`${at} → ${code}, stopping`);
           break outer;
         }
-        const cards = res.results;
+        // A timeout still returns the cards scrolled so far: they go through the same checks and get saved.
+        const cards = timedOut ? (Array.isArray(res.partial_results) ? res.partial_results : []) : res.results;
 
         // Website selector sanity check BEFORE inserting: 10+ cards and zero website buttons
         // means the selector is probably broken, and every card would look like a lead.
@@ -514,6 +529,23 @@ async function runLoop(rec) {
 
         const stats = await processCards(cards, ctx, spam, res.selector_version, rec.dry);
         totals.seen += stats.seen; totals.inserted += stats.inserted; totals.dupes += stats.dupes; totals.outOfArea += stats.outOfArea;
+
+        if (timedOut) {
+          // Logged as 'error' (planWork counts it as a failure, not as searched). The city+category waits
+          // for a later run; on the FAIL_LIMIT-th failure planWork splits or skips the area right away.
+          const n = (failed.get(subArea) ?? 0) + 1;
+          failed.set(subArea, n);
+          const then = n < FAIL_LIMIT ? 'retried next run' : next.zoom < MAX_ZOOM ? 'split next' : `skipped at max zoom ${MAX_ZOOM}`;
+          await logSearch(ctx, stats, 'error', `server; timeout after ${res.timeout_s ?? '?'}s (failure ${n}), ${stats.seen} partial cards saved — ${then}`);
+          rec.log(`${city} | ${category} | ${subArea} (${next.zoom}z) → timeout ${n}/${FAIL_LIMIT}, partial seen ${stats.seen}, new ${stats.inserted}: ${then}`);
+          if (timeoutStreak >= TIMEOUT_STREAK_STOP) {
+            status = 'error';
+            stopReason = `harvest_tile timed out on ${timeoutStreak} searches in a row (last ${where(category, city, subArea)}); browser degraded? restart the harvest server`;
+            break outer;
+          }
+          if (n < FAIL_LIMIT || rec.dry) sessionDone.add(key); // dry runs log nothing, so planWork would pick it again
+          break;
+        }
 
         const isCapped = res.saturated || cards.length >= CAP_THRESHOLD;
         searched.add(subArea);

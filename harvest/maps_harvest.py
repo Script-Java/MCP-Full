@@ -127,7 +127,7 @@ CONFIG: dict[str, Any] = {
     "limit_default": 50,
     "limit_max": 120,
     "saturation_count": 120,               # Google's feed cap
-    "timeout_s": _env_float("HARVEST_TIMEOUT_S", 60.0),
+    "timeout_s": _env_float("HARVEST_TIMEOUT_S", 90.0),
     "pause_min_s": _env_float("HARVEST_PAUSE_MIN_S", 1.8),
     "pause_max_s": _env_float("HARVEST_PAUSE_MAX_S", 4.5),
     "max_consecutive_empty": _env_int("HARVEST_MAX_CONSECUTIVE_EMPTY", 5),
