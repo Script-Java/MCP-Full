@@ -242,7 +242,7 @@ export function geocodeParts(lead) {
   return [streetOf(lead.address), cityNorm(city), 'TX', zip];
 }
 
-async function geocode(rows) {
+export async function geocode(rows) {
   if (!rows.length) return new Map();
   const csv = rows.map((r, i) => [i, ...geocodeParts(r)].map(csvField).join(',')).join('\n');
   const form = new FormData();
@@ -251,8 +251,11 @@ async function geocode(rows) {
   form.append('vintage', 'Current_Current');
   const res = await fetch(CENSUS, { method: 'POST', body: form, signal: AbortSignal.timeout(300000) });
   if (!res.ok) throw new Error(`census geocoder ${res.status}`);
-  const byIdx = parseCensus(await res.text());
-  return new Map(rows.map((r, i) => [r.source_id, byIdx.get(String(i)) ?? { match: 'no_match' }]));
+  const body = await res.text();
+  const byIdx = parseCensus(body);
+  if (!byIdx.size) throw new Error(`census answered no rows: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+  // Rows missing from the answer stay un-geocoded (retried next run), never 'no_match'.
+  return new Map(rows.flatMap((r, i) => (byIdx.has(String(i)) ? [[r.source_id, byIdx.get(String(i))]] : [])));
 }
 
 // ---- enrichment (Maps listing signals) ------------------------------------------------
@@ -286,13 +289,13 @@ const COLS = ['source_id', 'name', 'city', 'address', 'zip', 'phone', 'phone_e16
   'closed_status', 'newest_review_date', 'hours_present', 'photo_count', 'geo_match', 'geo_county_fips', 'geocoded_at'];
 
 /**
- * Score up to `limit` rows that are unscored (or scored by another version). A harvested row with a Maps
- * link waits for its listing signals, so promote_to_review never routes it on half the data.
+ * Score up to `limit` rows that are unscored (or scored by another version). A row with a Maps link waits for
+ * its listing signals, and a row with an address for its geocode, so nothing is scored (or routed) on half the data.
  */
 export async function scoreLeads({ limit = 200 } = {}, log = () => {}) {
-  const rows = await sql(`select ${COLS.join(',')} from ${TABLE} where city is not null
+  let rows = await sql(`select ${COLS.join(',')} from ${TABLE} where city is not null
     and (scored_at is null or scorer_version is distinct from ${lit(SCORER_VERSION)})
-    and (signals_at is not null or google_maps_url is null or state is distinct from 'harvested')
+    and (signals_at is not null or google_maps_url is null)
     order by first_seen desc limit ${limit}`);
   if (!rows.length) return { scored: 0 };
 
@@ -304,6 +307,7 @@ export async function scoreLeads({ limit = 200 } = {}, log = () => {}) {
     const vals = [];
     for (const r of toGeo) {
       const g = geo.get(r.source_id);
+      if (!g) continue;
       Object.assign(r, { geo_match: g.match, geo_county_fips: g.county_fips ?? null });
       vals.push(`(${[r.source_id, g.match, g.lat ?? null, g.lng ?? null, g.county_fips ?? null].map(lit).join(',')})`);
     }
@@ -312,6 +316,8 @@ export async function scoreLeads({ limit = 200 } = {}, log = () => {}) {
         from (values ${vals.join(',')}) as v(id, m, lat, lng, c) where t.source_id = v.id`);
     }
   } catch (err) { geoError = String(err?.message ?? err); log(`geocode failed: ${geoError}`); }
+  const waiting = rows.filter((r) => String(r.address ?? '').trim() && !r.geo_match).length;
+  rows = rows.filter((r) => !String(r.address ?? '').trim() || r.geo_match);
 
   // 2. Duplicates: another row with the same phone that was seen first (ties: lower source_id).
   const phones = [...new Set(rows.map((r) => r.phone_e164).filter(Boolean))];
@@ -342,7 +348,8 @@ export async function scoreLeads({ limit = 200 } = {}, log = () => {}) {
       scored_at=now(), scorer_version=${lit(SCORER_VERSION)}
       from (values ${vals.slice(i, i + 100).join(',')}) as v(id, score, tier, b, rr, dup) where t.source_id = v.id`);
   }
-  return { scored: rows.length, ...tiers, geocoded: geoError ? 0 : toGeo.length, geocode_error: geoError, permits_loaded: Boolean(db) };
+  return { scored: rows.length, ...tiers, geocoded: toGeo.filter((r) => r.geo_match).length, waiting_for_geocode: waiting,
+    geocode_error: geoError, permits_loaded: Boolean(db) };
 }
 
 // ---- MCP tool + nightly job ------------------------------------------------------------
