@@ -17,7 +17,7 @@ import {
   jobResult, leadRunStatus, startLeadRun, withEarlyReturn,
 } from './local-tools.js';
 import { START_TILE_RUN_TOOL, TILE_RUN_STATUS_TOOL, startTileRun, tileRunStatus } from './tile-run.js';
-import { SCORE_LEADS_TOOL, scoreLeadsTool } from './scorer.js';
+import { BACKFILL_STATUS_TOOL, SCORE_LEADS_TOOL, START_BACKFILL_TOOL, backfillStatus, scoreLeadsTool, startBackfill } from './scorer.js';
 
 const SEP = '__';
 // Cap on the text a single tool result may carry back to the client. Page
@@ -83,6 +83,8 @@ export function createDownstreamServer(upstreams, opts) {
     local.set(START_TILE_RUN_TOOL.name, [START_TILE_RUN_TOOL, (a) => startTileRun(a)]);
     local.set(TILE_RUN_STATUS_TOOL.name, [TILE_RUN_STATUS_TOOL, tileRunStatus]);
     local.set(SCORE_LEADS_TOOL.name, [SCORE_LEADS_TOOL, scoreLeadsTool]);
+    local.set(START_BACKFILL_TOOL.name, [START_BACKFILL_TOOL, startBackfill]);
+    local.set(BACKFILL_STATUS_TOOL.name, [BACKFILL_STATUS_TOOL, backfillStatus]);
   }
   const localTool = (qualified) => {
     if (!aggregate) return local.get(qualified);

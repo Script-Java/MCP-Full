@@ -5,17 +5,21 @@
 //  - phone: libphonenumber (offline); duplicates = same phone_e164 as an older row
 //  - Comptroller: active sales-tax + franchise-tax permit holders for the target counties, pulled
 //    nightly from data.texas.gov (Socrata) into a local SQLite table tx_permits on the volume
-//  - score_leads(limit) tool; tile runs call enrichLeads + scoreLeads when they finish
+//  - score_leads(limit, force) tool; tile runs call enrichLeads + scoreLeads when they finish
+//  - start_signals_backfill / signals_backfill_status: check_operating for older leads with no signals
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parsePhoneNumberFromString } from 'libphonenumber-js/max';
-import { callHarvest, cronMatches, lit, parseCron, sql } from './tile-run.js';
+import { leadRunActive } from './local-tools.js';
+import { MAX_DELAY_MS, MIN_DELAY_MS, callHarvest, cronMatches, lit, parseCron, sql, tileRunActive } from './tile-run.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export const SCORER_VERSION = 'v1';
 const TABLE = 'public."no-Website-lead"';
 const DATA_DIR = process.env.MCP_DATA_DIR || '/data';
-export const PERMITS_DB = path.join(DATA_DIR, 'tx_permits.db');
+export const PERMITS_DB = path.join(DATA_DIR, 'tx_permits_v2.db');
 const MAX_LIMIT = 1000;
 // Target counties as 5-digit FIPS (Census). Default: DFW core (Collin, Dallas, Denton, Tarrant).
 export const TARGET_FIPS = (process.env.SCORE_TARGET_COUNTIES || '48085,48113,48121,48439')
@@ -85,8 +89,12 @@ export function scoreLead(lead, sig, now = Date.now()) {
 
 // ---- names ---------------------------------------------------------------------
 const SUFFIX = /\b(llc|l l c|inc|incorporated|corp|corporation|co|company|ltd|lp|llp|pllc|pc|dba|the|and|of)\b/g;
+// Generic trade words dropped too: "Smith Plumbing Services LLC" and "SMITH PLUMBING" compare as "smith".
+const GENERIC = /\b(maintenance|electric|electrical|plumbing|services|service)\b/g;
+/** Name core for permit matching: lower case, punctuation, legal suffixes and generic trade words removed. */
 export const permitNorm = (s) => String(s ?? '').toLowerCase().replace(/['’]/g, '').replace(/&/g, ' and ').replace(/[^a-z0-9\s]/g, ' ')
-  .replace(SUFFIX, ' ').replace(/\s+/g, ' ').trim();
+  .replace(SUFFIX, ' ').replace(GENERIC, ' ').replace(/\s+/g, ' ').trim();
+export const zipOf = (lead) => String(lead.address ?? '').match(/\b(7[5-9]\d{3})\b/)?.[1] ?? (/^\d{5}$/.test(String(lead.zip ?? '')) ? String(lead.zip) : null);
 export const cityNorm = (s) => String(s ?? '').toLowerCase().replace(/,\s*tx$/i, '').replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
 
 function bigrams(s) {
@@ -105,19 +113,16 @@ export function similarity(a, b) {
   for (const c of B.values()) n += c;
   return n ? (2 * inter) / n : 0;
 }
-const MATCH_MIN = 0.8;
-// Generic trade words: "Ben's Plumbing" vs "E&S Plumbing" share them, so the rest of the name must match too.
-const GENERIC = /\b(plumbing|plumber|plumbers|electric|electrical|electrician|roofing|hvac|heating|cooling|air|ac|lawn|care|landscaping|landscape|tree|pest|control|fence|fencing|concrete|painting|painter|handyman|garage|door|doors|pressure|washing|auto|repair|repairs|appliance|flooring|junk|removal|locksmith|welding|mobile|mechanic|towing|septic|moving|movers|service|services|solutions|pros|professional|contractor|contractors|construction|group|enterprises|texas|tx|dfw|dallas|north)\b/g;
-const distinctive = (nn) => nn.replace(GENERIC, ' ').replace(/\s+/g, ' ').trim();
-/** Same business name? Whole name and its non-generic part must both be MATCH_MIN similar. */
-export function nameMatch(a, b) {
-  const s = similarity(a, b);
-  if (s < MATCH_MIN) return 0;
-  const da = distinctive(a); const db = distinctive(b);
-  return !da && !db ? s : similarity(da, db) >= MATCH_MIN ? s : 0;
-}
+const MATCH_MIN = 0.9;
+/** Similarity of two name cores (permitNorm output) if >= MATCH_MIN, else 0. An empty core never matches. */
+export const nameMatch = (a, b) => {
+  const s = a && b ? similarity(a, b) : 0;
+  return s >= MATCH_MIN ? s : 0;
+};
 
 // ---- Comptroller permits (SQLite on the volume) ---------------------------------
+// v2 adds zip and the stricter name core; the v1 file is deleted on the first v2 download.
+const PERMITS_DB_V1 = path.join(DATA_DIR, 'tx_permits.db');
 let permitsDb = null;
 function openPermits() {
   if (permitsDb) return permitsDb;
@@ -126,14 +131,17 @@ function openPermits() {
   return permitsDb;
 }
 
-/** Best permit for a lead in its city, or null. ponytail: LIKE scan per lead on the city index; fine for 1M rows x 1000 leads. */
-export function matchPermit(db, name, city) {
+/**
+ * Best permit with the same city or zip and a name core >= MATCH_MIN similar, or null.
+ * ponytail: LIKE scan per lead on the city / zip index; fine for 1M rows x 1000 leads.
+ */
+export function matchPermit(db, name, city, zip = null) {
   const nn = permitNorm(name);
   const c = cityNorm(city);
   const tok = nn.split(' ').filter((w) => w.length >= 3).sort((x, y) => y.length - x.length)[0];
-  if (!tok || !c) return null;
-  const rows = db.prepare('select source, taxpayer_number, name, name_norm from tx_permits where city = ? and name_norm like ?')
-    .all(c, `%${tok}%`);
+  if (!tok || (!c && !zip)) return null;
+  const rows = db.prepare('select source, taxpayer_number, name, name_norm from tx_permits where (city = ? or zip = ?) and name_norm like ?')
+    .all(c || null, zip || null, `%${tok}%`);
   let best = null;
   for (const r of rows) {
     const s = nameMatch(nn, r.name_norm);
@@ -164,37 +172,39 @@ export function refreshPermits(log) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.rmSync(tmp, { force: true });
     const db = new DatabaseSync(tmp);
-    db.exec('create table tx_permits (source text, taxpayer_number text, name text, name_norm text, city text, county text)');
-    const ins = db.prepare('insert into tx_permits values (?, ?, ?, ?, ?, ?)');
+    db.exec('create table tx_permits (source text, taxpayer_number text, name text, name_norm text, city text, zip text, county text)');
+    const ins = db.prepare('insert into tx_permits values (?, ?, ?, ?, ?, ?, ?)');
     const codes = TARGET_FIPS.map(comptrollerCode);
     let n = 0;
-    const add = (source, num, name, city, county) => {
+    const add = (source, num, name, city, zip, county) => {
       const nn = permitNorm(name);
-      if (nn) { ins.run(source, num ?? null, name, nn, cityNorm(city), county); n++; }
+      if (nn) { ins.run(source, num ?? null, name, nn, cityNorm(city), String(zip ?? '').slice(0, 5) || null, county); n++; }
     };
     try {
-      for await (const rows of sodaPages('jrea-zgmq', 'taxpayer_number,taxpayer_name,outlet_name,outlet_city,outlet_county_code',
+      for await (const rows of sodaPages('jrea-zgmq', 'taxpayer_number,taxpayer_name,outlet_name,outlet_city,outlet_zip_code,outlet_county_code',
         `outlet_county_code in (${codes.map((c) => `'${c}'`).join(',')})`)) {
         db.exec('begin');
         for (const r of rows) {
-          add('sales_tax', r.taxpayer_number, r.outlet_name || r.taxpayer_name, r.outlet_city, r.outlet_county_code);
+          add('sales_tax', r.taxpayer_number, r.outlet_name || r.taxpayer_name, r.outlet_city, r.outlet_zip_code, r.outlet_county_code);
           if (r.taxpayer_name && r.outlet_name && permitNorm(r.taxpayer_name) !== permitNorm(r.outlet_name)) {
-            add('sales_tax', r.taxpayer_number, r.taxpayer_name, r.outlet_city, r.outlet_county_code);
+            add('sales_tax', r.taxpayer_number, r.taxpayer_name, r.outlet_city, r.outlet_zip_code, r.outlet_county_code);
           }
         }
         db.exec('commit');
       }
-      for await (const rows of sodaPages('9cir-efmm', 'taxpayer_number,taxpayer_name,taxpayer_city,taxpayer_county_code',
+      for await (const rows of sodaPages('9cir-efmm', 'taxpayer_number,taxpayer_name,taxpayer_city,taxpayer_zip,taxpayer_county_code',
         `taxpayer_county_code in (${codes.map(Number).join(',')}) and right_to_transact_business_code='A' and current_exempt_reason_code is null`)) {
         db.exec('begin');
-        for (const r of rows) add('franchise_tax', r.taxpayer_number, r.taxpayer_name, r.taxpayer_city, String(r.taxpayer_county_code).padStart(3, '0'));
+        for (const r of rows) add('franchise_tax', r.taxpayer_number, r.taxpayer_name, r.taxpayer_city, r.taxpayer_zip, String(r.taxpayer_county_code).padStart(3, '0'));
         db.exec('commit');
       }
       db.exec('create index tx_permits_city on tx_permits (city)');
+      db.exec('create index tx_permits_zip on tx_permits (zip)');
       db.close();
       permitsDb?.close();
       permitsDb = null;
       fs.renameSync(tmp, PERMITS_DB);
+      fs.rmSync(PERMITS_DB_V1, { force: true });
       log?.info(`[scorer] tx_permits refreshed: ${n} rows for counties ${TARGET_FIPS.join(',')}`);
       return n;
     } catch (err) {
@@ -259,27 +269,44 @@ export async function geocode(rows) {
 }
 
 // ---- enrichment (Maps listing signals) ------------------------------------------------
-/** check_operating for up to `max` not-yet-judged (state harvested) leads with no signals. Stops on guard errors. */
+const NEEDS_SIGNALS = `city is not null and signals_at is null and google_maps_url like 'https://www.google.com/maps?cid=%'`;
+
+/** One check_operating for a lead; on success its signals are stored and it is queued for re-scoring. Returns the harvest answer. */
+async function fillSignals(r) {
+  const s = await callHarvest('check_operating', { maps_url: r.google_maps_url });
+  if (s.error) return s;
+  let host = null;
+  try { host = s.website_url ? new URL(s.website_url).hostname : null; } catch {}
+  const web = s.website_url ? (host && SOCIAL_HOSTS.test(host) ? 'social_only' : 'website') : null;
+  await sql(`update ${TABLE} set closed_status=${lit(s.closed_status)}, newest_review_date=${lit(s.most_recent_review_date)},
+    hours_present=${lit(s.hours_present)}, address=coalesce(${lit(s.address)}, address), geocoded_at=null, photo_count=${lit(s.photo_count)},
+    review_count=coalesce(${lit(s.review_count)}, review_count), website_class=coalesce(${lit(web)}, website_class), signals_at=now(), scored_at=null
+    where source_id=${lit(r.source_id)}`);
+  return s;
+}
+
+/** Stop a run of check_operating calls? Guard errors stop at once; selectors_stale is often one removed listing, so 3 in a row. */
+export function makeStopper() {
+  let stale = 0;
+  return (code) => {
+    if (code === 'selectors_stale') return ++stale >= 3;
+    stale = 0;
+    return Boolean(code) && HARVEST_STOP.has(code);
+  };
+}
+
+/** check_operating for up to `max` not-yet-judged (state harvested) leads with no signals (end of a tile run). */
 export async function enrichLeads(max = ENRICH_MAX, log = () => {}) {
   if (!(max > 0)) return { enriched: 0 };
-  const rows = await sql(`select source_id, google_maps_url from ${TABLE} where city is not null and signals_at is null
-    and state = 'harvested' and google_maps_url like 'https://www.google.com/maps?cid=%' order by first_seen desc limit ${Math.floor(max)}`);
+  const rows = await sql(`select source_id, google_maps_url from ${TABLE} where ${NEEDS_SIGNALS} and state = 'harvested'
+    order by first_seen desc limit ${Math.floor(max)}`);
+  const stop = makeStopper();
   let enriched = 0;
   for (const r of rows) {
-    const s = await callHarvest('check_operating', { maps_url: r.google_maps_url });
-    if (s.error) {
-      log(`enrich ${r.source_id} → ${s.error}`);
-      if (HARVEST_STOP.has(s.error)) return { enriched, stopped: s.error };
-      continue;
-    }
-    let host = null;
-    try { host = s.website_url ? new URL(s.website_url).hostname : null; } catch {}
-    const web = s.website_url ? (host && SOCIAL_HOSTS.test(host) ? 'social_only' : 'website') : null;
-    await sql(`update ${TABLE} set closed_status=${lit(s.closed_status)}, newest_review_date=${lit(s.most_recent_review_date)},
-      hours_present=${lit(s.hours_present)}, address=coalesce(${lit(s.address)}, address), geocoded_at=null, photo_count=${lit(s.photo_count)}, review_count=coalesce(${lit(s.review_count)}, review_count),
-      website_class=coalesce(${lit(web)}, website_class), signals_at=now(), scored_at=null
-      where source_id=${lit(r.source_id)}`);
-    enriched++;
+    const s = await fillSignals(r);
+    if (s.error) log(`enrich ${r.source_id} → ${s.error}`);
+    else enriched++;
+    if (stop(s.error)) return { enriched, stopped: s.error };
   }
   return { enriched };
 }
@@ -289,13 +316,15 @@ const COLS = ['source_id', 'name', 'city', 'address', 'zip', 'phone', 'phone_e16
   'closed_status', 'newest_review_date', 'hours_present', 'photo_count', 'geo_match', 'geo_county_fips', 'geocoded_at'];
 
 /**
- * Score up to `limit` rows that are unscored (or scored by another version). A row with a Maps link waits for
- * its listing signals, and a row with an address for its geocode, so nothing is scored (or routed) on half the data.
+ * Score up to `limit` rows that are unscored (or scored by another version). Rows without listing signals are
+ * skipped unless `force`, and a row with an address waits for its geocode, so nothing is scored (or routed) on
+ * half the data. `ids`: only these source_ids (the backfill re-scores what it just filled).
  */
-export async function scoreLeads({ limit = 200 } = {}, log = () => {}) {
+export async function scoreLeads({ limit = 200, force = false, ids = null } = {}, log = () => {}) {
   let rows = await sql(`select ${COLS.join(',')} from ${TABLE} where city is not null
     and (scored_at is null or scorer_version is distinct from ${lit(SCORER_VERSION)})
-    and (signals_at is not null or google_maps_url is null)
+    ${force ? '' : 'and signals_at is not null'}
+    ${ids ? `and source_id = any(array[${ids.map(lit).join(',')}]::text[])` : ''}
     order by first_seen desc limit ${limit}`);
   if (!rows.length) return { scored: 0 };
 
@@ -337,7 +366,7 @@ export async function scoreLeads({ limit = 200 } = {}, log = () => {}) {
     const geoKnown = r.geo_match === 'exact' || r.geo_match === 'non_exact';
     const inTarget = geoKnown && r.geo_county_fips ? TARGET_FIPS.includes(r.geo_county_fips)
       : db ? cityKnown(db, r.city) : null; // no geocode: the town must have permit holders in a target county
-    const sig = { inTarget, dupOf: first && first !== r.source_id ? first : null, permit: db ? matchPermit(db, r.name, r.city) : null };
+    const sig = { inTarget, dupOf: first && first !== r.source_id ? first : null, permit: db ? matchPermit(db, r.name, r.city, zipOf(r)) : null };
     const s = scoreLead(r, sig);
     if (!db) s.breakdown.comptroller.value = 'tx_permits not loaded yet';
     tiers[s.tier]++;
@@ -359,10 +388,14 @@ export const SCORE_LEADS_TOOL = {
     `Score unscored rows of public."no-Website-lead" (city not null) with scorer ${SCORER_VERSION}: Census geocode, phone check, ` +
     'duplicate check, Comptroller permit match, Maps signals already on the row. Writes score, tier (qualified >= 70, review 45-69, ' +
     'rejected < 45 or a gate: closed, real website, outside the target counties, duplicate), score_breakdown, reject_reason. ' +
-    'No browsing; tile runs call it automatically at the end.',
+    'No browsing: rows with no Maps listing signals yet (signals_at null) are skipped unless force=true; ' +
+    'start_signals_backfill fills them. Tile runs call it automatically at the end.',
   inputSchema: {
     type: 'object',
-    properties: { limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, description: 'Rows to score (default 200).' } },
+    properties: {
+      limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, description: 'Rows to score (default 200).' },
+      force: { type: 'boolean', description: 'Also score rows with no listing signals (they lose the review, hours and photo points).' },
+    },
   },
 };
 
@@ -370,10 +403,98 @@ let scoring = null;
 export async function scoreLeadsTool(args) {
   const limit = Number(args?.limit ?? 200);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) return fail(`limit must be an integer 1-${MAX_LIMIT}`);
+  if (args?.force !== undefined && typeof args.force !== 'boolean') return fail('force must be true or false');
   if (scoring) return fail('a scoring run is already going; try again shortly');
-  scoring = scoreLeads({ limit });
+  scoring = scoreLeads({ limit, force: args?.force === true });
   try { return text(await scoring); } catch (err) { return fail(`score_leads failed: ${String(err?.message ?? err).slice(0, 300)}`); }
   finally { scoring = null; }
+}
+
+// ---- signals backfill -----------------------------------------------------------------
+// check_operating for leads (any state, scored or not) with no listing signals, at the tile-run pace (12-30 s
+// between calls), re-scoring every 25. Waits while a tile or lead run uses the Maps browser; one backfill at a time.
+const BACKFILL_DIR = path.join(DATA_DIR, 'backfill');
+const BACKFILL_CAP = 1000;
+let backfill = null;
+
+export const START_BACKFILL_TOOL = {
+  name: 'start_signals_backfill',
+  description:
+    'Start a background job and return at once: harvest check_operating for up to max leads of public."no-Website-lead" with no ' +
+    'Maps listing signals (signals_at null, any state, scored or not), at the normal harvest pace (12-30 s between calls, about ' +
+    '35 s per lead). Fills newest_review_date, hours_present, photo_count, closed_status, review_count (and the full address and ' +
+    'website), then re-scores them. Pauses while a tile or lead run is going; stops on a Google challenge or an exhausted budget. ' +
+    'Each lead is one Maps call against the daily harvest budget. Check progress with signals_backfill_status.',
+  inputSchema: {
+    type: 'object',
+    properties: { max: { type: 'integer', minimum: 1, maximum: BACKFILL_CAP, description: 'Leads to check (default 100).' } },
+  },
+};
+
+export const BACKFILL_STATUS_TOOL = {
+  name: 'signals_backfill_status',
+  description: 'Progress of the current (or last) signals backfill: running, checked, filled, errors, scored, stop_reason, last log lines.',
+  inputSchema: { type: 'object', properties: {} },
+};
+
+const backfillSummary = (b) => ({
+  run_id: b.id, running: b.running, max: b.max, candidates: b.candidates, checked: b.checked, filled: b.filled, errors: b.errors,
+  scored: b.scored, waiting_for: b.waitingFor, stop_reason: b.stopReason, elapsed_s: Math.round(((b.finished ?? Date.now()) - b.started) / 1000),
+});
+
+export function startBackfill(args) {
+  const max = Number(args?.max ?? 100);
+  if (!Number.isInteger(max) || max < 1 || max > BACKFILL_CAP) return fail(`max must be an integer 1-${BACKFILL_CAP}`);
+  if (backfill?.running) return fail(`a backfill is already going (${backfill.id}); check signals_backfill_status`);
+  fs.mkdirSync(BACKFILL_DIR, { recursive: true });
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-backfill-${max}`;
+  const file = path.join(BACKFILL_DIR, `${id}.log`);
+  const b = {
+    id, max, file, started: Date.now(), running: true, candidates: null, checked: 0, filled: 0, errors: 0, scored: 0,
+    waitingFor: null, stopReason: null,
+    log: (...a) => fs.appendFileSync(file, `${new Date().toISOString().slice(11, 19)} ${a.join(' ')}\n`),
+  };
+  backfill = b;
+  runBackfill(b).catch((err) => { b.stopReason = `error: ${String(err?.message ?? err).slice(0, 300)}`; b.log(b.stopReason); })
+    .finally(() => { b.running = false; b.finished = Date.now(); b.log('done', JSON.stringify(backfillSummary(b))); });
+  return text({ started: true, run_id: id, max, expected_minutes: Math.ceil((max * 35) / 60) });
+}
+
+async function runBackfill(b) {
+  const rows = await sql(`select source_id, google_maps_url from ${TABLE} where ${NEEDS_SIGNALS} order by first_seen desc limit ${b.max}`);
+  b.candidates = rows.length;
+  b.log(`backfill ${b.id}: ${rows.length} leads with no listing signals`);
+  const stop = makeStopper();
+  let batch = [];
+  const rescore = async () => {
+    if (!batch.length) return;
+    const s = await scoreLeads({ limit: batch.length, ids: batch }, (m) => b.log(m));
+    b.scored += s.scored;
+    b.log(`re-scored ${JSON.stringify(s)}`);
+    batch = [];
+  };
+  for (const r of rows) {
+    for (;;) { // the Maps browser and budget are shared: tile and lead runs go first
+      b.waitingFor = tileRunActive() ? 'tile run' : leadRunActive() ? 'lead run' : null;
+      if (!b.waitingFor) break;
+      await sleep(30000);
+    }
+    if (b.checked > 0) await sleep(MIN_DELAY_MS + Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS));
+    const s = await fillSignals(r);
+    b.checked++;
+    if (s.error) { b.errors++; b.log(`${r.source_id} → ${s.error}`); }
+    else { b.filled++; batch.push(r.source_id); }
+    if (stop(s.error)) { b.stopReason = `harvest ${s.error}`; break; }
+    if (batch.length >= 25) await rescore();
+  }
+  await rescore();
+  b.stopReason ??= 'done';
+}
+
+export function backfillStatus() {
+  if (!backfill) return text({ running: false, note: 'no backfill started since the server last restarted' });
+  const lines = fs.existsSync(backfill.file) ? fs.readFileSync(backfill.file, 'utf8').split('\n').filter(Boolean) : [];
+  return text({ ...backfillSummary(backfill), last_lines: lines.slice(-8) });
 }
 
 /** Called once by index.js: nightly tx_permits refresh (and once now if the table is missing). */

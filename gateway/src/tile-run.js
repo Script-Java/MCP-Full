@@ -18,8 +18,8 @@ const TABLE = 'public."no-Website-lead"';
 const MAX_SEARCHES_CAP = 200;
 const DEFAULT_MAX_SEARCHES = Number(process.env.TILE_RUN_MAX_SEARCHES || 30);
 const MAX_MINUTES = Number(process.env.TILE_RUN_MAX_MINUTES || 45);
-const MIN_DELAY_MS = Number(process.env.TILE_RUN_MIN_DELAY_MS ?? 12000);
-const MAX_DELAY_MS = Number(process.env.TILE_RUN_MAX_DELAY_MS ?? 30000);
+export const MIN_DELAY_MS = Number(process.env.TILE_RUN_MIN_DELAY_MS ?? 12000);
+export const MAX_DELAY_MS = Number(process.env.TILE_RUN_MAX_DELAY_MS ?? 30000);
 const SELECTOR_REFRESH_MS = 5 * 60 * 1000;
 const CRON_TZ = 'America/Chicago';
 
@@ -368,6 +368,8 @@ export async function refreshSelectors() {
 // ---- the run ----------------------------------------------------------------
 /** @type {any} */
 let current = null;
+/** True while a tile run is going (the signals backfill waits for it: same browser and budget). */
+export const tileRunActive = () => Boolean(current?.running);
 
 export const START_TILE_RUN_TOOL = {
   name: 'start_tile_run',
