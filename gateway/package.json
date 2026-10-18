@@ -12,6 +12,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.5",
     "@modelcontextprotocol/sdk": "1.30.0",
     "libphonenumber-js": "1.12.9",
     "zod": "^3.25.0"

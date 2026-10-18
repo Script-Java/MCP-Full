@@ -209,3 +209,28 @@ from "no-Website-lead"
 where state = 'needs_review' and tier = 'review'
 order by score desc, first_seen
 limit 200;
+
+-- 8. Overture Places for scorer v2 (loaded monthly by gateway/scripts/overture-load.mjs; ~390k DFW rows).
+--    Points only, so the geometry is kept as lng / lat. phones_e164 = phones normalized to +1XXXXXXXXXX.
+create table if not exists overture_places (
+  id          text primary key,
+  name        text,               -- names.primary
+  confidence  double precision,
+  websites    text[],
+  socials     text[],
+  phones      text[],
+  phones_e164 text[],
+  addresses   jsonb,
+  lng         double precision,
+  lat         double precision
+);
+create index if not exists overture_places_phones_idx on overture_places using gin (phones_e164);
+create index if not exists overture_places_lat_lng_idx on overture_places (lat, lng);
+-- One row: which release is loaded. status 'loading' while the table is being refilled (the scorer waits).
+create table if not exists overture_meta (
+  id int primary key default 1 check (id = 1),
+  release text, status text check (status in ('loading', 'ready')), rows int, started_at timestamptz, loaded_at timestamptz
+);
+-- Only the gateway (service role) reads these; no API access.
+alter table overture_places enable row level security;
+alter table overture_meta enable row level security;

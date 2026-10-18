@@ -5,18 +5,22 @@
 //  - phone: libphonenumber (offline); duplicates = same phone_e164 as an older row
 //  - Comptroller: active sales-tax + franchise-tax permit holders for the target counties, pulled
 //    nightly from data.texas.gov (Socrata) into a local SQLite table tx_permits on the volume
+//  - Overture Places (v2): public.overture_places, loaded monthly by scripts/overture-load.mjs; a lead matched by
+//    phone, else name within 150 m: a real website there is the has_website gate, confidence >= 0.7 adds up to 10 points
 //  - score_leads(limit, force) tool; tile runs call enrichLeads + scoreLeads when they finish
 //  - start_signals_backfill / signals_backfill_status: check_operating for older leads with no signals
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
 import { parsePhoneNumberFromString } from 'libphonenumber-js/max';
 import { leadRunActive } from './local-tools.js';
 import { MAX_DELAY_MS, MIN_DELAY_MS, callHarvest, cronMatches, lit, parseCron, sql, tileRunActive } from './tile-run.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export const SCORER_VERSION = 'v1';
+export const SCORER_VERSION = 'v2';
 const TABLE = 'public."no-Website-lead"';
 const DATA_DIR = process.env.MCP_DATA_DIR || '/data';
 export const PERMITS_DB = path.join(DATA_DIR, 'tx_permits_v2.db');
@@ -45,8 +49,10 @@ export function phoneValid(phone) {
 const DAY = 86400000;
 const reviewAgeDays = (d, now) => (d ? Math.floor((now - new Date(d).getTime()) / DAY) : null);
 
+const OVERTURE_MIN_CONF = 0.7;
 /**
- * lead: a no-Website-lead row. sig: {inTarget: true|false|null, dupOf: source_id|null, permit: {...}|null}.
+ * lead: a no-Website-lead row. sig: {inTarget: true|false|null, dupOf: source_id|null, permit: {...}|null,
+ * overture: {id, name, matched_by, confidence, socials, website}|null}.
  * Returns {score, tier, reject_reason, breakdown}; breakdown has every check's value and points.
  */
 export function scoreLead(lead, sig, now = Date.now()) {
@@ -74,10 +80,13 @@ export function scoreLead(lead, sig, now = Date.now()) {
   score += put('phone_valid_unique', { valid, duplicate_of: sig.dupOf ?? null }, valid && !sig.dupOf ? 10 : 0);
   score += put('comptroller', sig.permit ?? null, sig.permit ? 10 : 0);
   score += put('trade_category', lead.category ?? null, TRADE_RE.test(lead.category ?? '') ? 10 : 0);
+  const o = sig.overture;
+  score += put('overture', o ? { id: o.id, name: o.name, matched_by: o.matched_by, confidence: o.confidence, socials: o.socials ?? [], website: o.website } : null,
+    o?.confidence >= OVERTURE_MIN_CONF ? Math.round(o.confidence * 10) : 0);
 
   const gate = lead.closed_status === 'permanent' ? 'closed_permanently'
     : lead.closed_status === 'temporary' ? 'closed_temporarily'
-    : lead.website_class === 'website' ? 'has_website'
+    : lead.website_class === 'website' || o?.website ? 'has_website'
     : sig.inTarget === false ? 'outside_target_area'
     : sig.dupOf ? `duplicate_of:${sig.dupOf}`
     : null;
@@ -216,6 +225,70 @@ export function refreshPermits(log) {
   return permitsRefreshing;
 }
 
+// ---- Overture Places (public.overture_places, filled monthly by scripts/overture-load.mjs) ------------
+// Not a business's own site: social profiles, link pages and directories (Overture lists all of these as websites).
+const LISTING_HOSTS = /(^|\.)(facebook\.com|fb\.com|fb\.me|instagram\.com|linktr\.ee|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|yelp\.com|nextdoor\.com|yellowpages\.com|bbb\.org|angi\.com|homeadvisor\.com|thumbtack\.com|houzz\.com|mapquest\.com|business\.site)$/i;
+/** First URL that is a real website (not social / directory), or null. */
+export function realWebsite(urls) {
+  for (const u of urls ?? []) {
+    try {
+      if (!LISTING_HOSTS.test(new URL(/^https?:\/\//i.test(u) ? u : `http://${u}`).hostname)) return u;
+    } catch {}
+  }
+  return null;
+}
+const M_PER_DEG = 111320;
+const NEAR_M = 150;
+const metres = (a, b) => Math.hypot((b.lng - a.lng) * Math.cos((a.lat * Math.PI) / 180), b.lat - a.lat) * M_PER_DEG;
+
+/**
+ * Overture place per lead: same phone (E.164) first (highest confidence wins), else the most similar name core
+ * (permitNorm, >= MATCH_MIN) within NEAR_M of the lead's Census point. Map(source_id -> place + matched_by + website).
+ */
+export async function matchOverture(rows) {
+  const out = new Map();
+  const cols = 'p.id, p.name, p.confidence, p.websites, p.socials, p.phones_e164, p.lat, p.lng';
+  const set = (r, p, by) => out.set(r.source_id, { ...p, matched_by: by, website: realWebsite(p.websites) });
+  const phones = [...new Set(rows.map((r) => r.phone_e164).filter(Boolean))];
+  const byPhone = phones.length
+    ? await sql(`select ${cols} from overture_places p where p.phones_e164 && array[${phones.map(lit).join(',')}]::text[]`) : [];
+  for (const r of rows) {
+    const hits = r.phone_e164 ? byPhone.filter((p) => p.phones_e164?.includes(r.phone_e164)) : [];
+    if (hits.length) set(r, hits.reduce((a, b) => (b.confidence > a.confidence ? b : a)), 'phone');
+  }
+  const geo = rows.filter((r) => !out.has(r.source_id) && r.geo_lat != null && r.geo_lng != null && permitNorm(r.name));
+  if (!geo.length) return out;
+  const dLat = NEAR_M / M_PER_DEG;
+  const dLng = dLat / Math.cos((34 * Math.PI) / 180); // DFW is below 34° N, so this box always holds the 150 m circle
+  const near = await sql(`select v.id as lead_id, ${cols} from (values ${geo.map((r) => `(${[r.source_id, r.geo_lat, r.geo_lng].map(lit).join(',')})`).join(',')})
+      as v(id, lat, lng)
+    join overture_places p on p.lat between v.lat::float8 - ${dLat} and v.lat::float8 + ${dLat}
+      and p.lng between v.lng::float8 - ${dLng} and v.lng::float8 + ${dLng}`);
+  for (const r of geo) {
+    const nn = permitNorm(r.name);
+    const here = { lat: Number(r.geo_lat), lng: Number(r.geo_lng) };
+    let best = null;
+    for (const p of near) {
+      if (p.lead_id !== r.source_id || metres(here, { lat: Number(p.lat), lng: Number(p.lng) }) > NEAR_M) continue;
+      const s = nameMatch(nn, permitNorm(p.name));
+      if (s && (!best || s > best.s || (s === best.s && p.confidence > best.p.confidence))) best = { s, p };
+    }
+    if (best) set(r, best.p, 'name_150m');
+  }
+  return out;
+}
+
+/** 'ready' (with release), 'loading' (a load started in the last 3 h), or null (never loaded / table missing / stale). */
+export async function overtureState() {
+  let m;
+  try {
+    [m] = await sql('select release, status, extract(epoch from now() - started_at)::int as age_s from overture_meta where id = 1');
+  } catch { return null; }
+  if (m?.status === 'ready') return { status: 'ready', release: m.release };
+  if (m?.status === 'loading' && m.age_s < 3 * 3600) return { status: 'loading', release: m.release };
+  return null;
+}
+
 // ---- Census batch geocoder ---------------------------------------------------------
 const CENSUS = 'https://geocoding.geo.census.gov/geocoder/geographies/addressbatch';
 const csvField = (v) => `"${String(v ?? '').replace(/"/g, '""').replace(/[\r\n]+/g, ' ')}"`;
@@ -269,7 +342,9 @@ export async function geocode(rows) {
 }
 
 // ---- enrichment (Maps listing signals) ------------------------------------------------
-const NEEDS_SIGNALS = `city is not null and signals_at is null and google_maps_url like 'https://www.google.com/maps?cid=%'`;
+// Any URL check_operating accepts (harvest _ALLOWED_MAPS_HOSTS): cards with no cid are saved as /maps/place/... links.
+const NEEDS_SIGNALS = `city is not null and signals_at is null
+  and google_maps_url ~ '^https://(www\\.google\\.com|google\\.com|maps\\.google\\.com|maps\\.app\\.goo\\.gl)/'`;
 
 /** One check_operating for a lead; on success its signals are stored and it is queued for re-scoring. Returns the harvest answer. */
 async function fillSignals(r) {
@@ -313,14 +388,21 @@ export async function enrichLeads(max = ENRICH_MAX, log = () => {}) {
 
 // ---- scoring run --------------------------------------------------------------------
 const COLS = ['source_id', 'name', 'city', 'address', 'zip', 'phone', 'phone_e164', 'category', 'review_count', 'website_class',
-  'closed_status', 'newest_review_date', 'hours_present', 'photo_count', 'geo_match', 'geo_county_fips', 'geocoded_at'];
+  'closed_status', 'newest_review_date', 'hours_present', 'photo_count', 'geo_match', 'geo_county_fips', 'geocoded_at',
+  'geo_lat', 'geo_lng', 'tier'];
 
 /**
  * Score up to `limit` rows that are unscored (or scored by another version). Rows without listing signals are
  * skipped unless `force`, and a row with an address waits for its geocode, so nothing is scored (or routed) on
  * half the data. `ids`: only these source_ids (the backfill re-scores what it just filled).
+ * Nothing is scored until overture_places is loaded (v2 without it would never be redone).
  */
 export async function scoreLeads({ limit = 200, force = false, ids = null } = {}, log = () => {}) {
+  const ov = await overtureState();
+  if (ov?.status !== 'ready') {
+    if (!ov) startOvertureLoad(log);
+    return { scored: 0, waiting_for: 'overture_places', overture: ov?.status ?? 'not loaded (load started)' };
+  }
   let rows = await sql(`select ${COLS.join(',')} from ${TABLE} where city is not null
     and (scored_at is null or scorer_version is distinct from ${lit(SCORER_VERSION)})
     ${force ? '' : 'and signals_at is not null'}
@@ -357,28 +439,38 @@ export async function scoreLeads({ limit = 200, force = false, ids = null } = {}
     for (const r of all) if (!firstByPhone.has(r.phone_e164)) firstByPhone.set(r.phone_e164, r.source_id);
   }
 
-  // 3. Comptroller permits + target area, then the score.
+  // 3. Overture match, Comptroller permits + target area, then the score.
+  const overture = rows.length ? await matchOverture(rows) : new Map();
   const db = openPermits();
   const vals = [];
   const tiers = { qualified: 0, review: 0, rejected: 0 };
+  const ovCount = { matched: overture.size, website_gate: 0, dropped_for_website: 0, gained_points: 0 };
   for (const r of rows) {
     const first = r.phone_e164 ? firstByPhone.get(r.phone_e164) : null;
     const geoKnown = r.geo_match === 'exact' || r.geo_match === 'non_exact';
     const inTarget = geoKnown && r.geo_county_fips ? TARGET_FIPS.includes(r.geo_county_fips)
       : db ? cityKnown(db, r.city) : null; // no geocode: the town must have permit holders in a target county
-    const sig = { inTarget, dupOf: first && first !== r.source_id ? first : null, permit: db ? matchPermit(db, r.name, r.city, zipOf(r)) : null };
+    const sig = { inTarget, dupOf: first && first !== r.source_id ? first : null, permit: db ? matchPermit(db, r.name, r.city, zipOf(r)) : null,
+      overture: overture.get(r.source_id) ?? null };
     const s = scoreLead(r, sig);
     if (!db) s.breakdown.comptroller.value = 'tx_permits not loaded yet';
+    // An Overture website the Maps listing did not show: the row now has a website too.
+    const ovSite = Boolean(sig.overture?.website) && r.website_class !== 'website';
+    if (ovSite && s.reject_reason === 'has_website') {
+      ovCount.website_gate++;
+      if (r.tier === 'qualified' || r.tier === 'review') ovCount.dropped_for_website++;
+    }
+    if (!s.breakdown.gate.value && s.breakdown.overture.points > 0) ovCount.gained_points++;
     tiers[s.tier]++;
-    vals.push(`(${[r.source_id, s.score, s.tier, JSON.stringify(s.breakdown), s.reject_reason, sig.dupOf].map(lit).join(',')})`);
+    vals.push(`(${[r.source_id, s.score, s.tier, JSON.stringify(s.breakdown), s.reject_reason, sig.dupOf, ovSite ? 'website' : null].map(lit).join(',')})`);
   }
   for (let i = 0; i < vals.length; i += 100) {
     await sql(`update ${TABLE} t set score=v.score::int, tier=v.tier, score_breakdown=v.b::jsonb, reject_reason=v.rr, duplicate_of=v.dup,
-      scored_at=now(), scorer_version=${lit(SCORER_VERSION)}
-      from (values ${vals.slice(i, i + 100).join(',')}) as v(id, score, tier, b, rr, dup) where t.source_id = v.id`);
+      website_class=coalesce(v.wc, t.website_class), scored_at=now(), scorer_version=${lit(SCORER_VERSION)}
+      from (values ${vals.slice(i, i + 100).join(',')}) as v(id, score, tier, b, rr, dup, wc) where t.source_id = v.id`);
   }
-  return { scored: rows.length, ...tiers, geocoded: toGeo.filter((r) => r.geo_match).length, waiting_for_geocode: waiting,
-    geocode_error: geoError, permits_loaded: Boolean(db) };
+  return { scored: rows.length, ...tiers, overture: { release: ov.release, ...ovCount }, geocoded: toGeo.filter((r) => r.geo_match).length,
+    waiting_for_geocode: waiting, geocode_error: geoError, permits_loaded: Boolean(db) };
 }
 
 // ---- MCP tool + nightly job ------------------------------------------------------------
@@ -386,8 +478,10 @@ export const SCORE_LEADS_TOOL = {
   name: 'score_leads',
   description:
     `Score unscored rows of public."no-Website-lead" (city not null) with scorer ${SCORER_VERSION}: Census geocode, phone check, ` +
-    'duplicate check, Comptroller permit match, Maps signals already on the row. Writes score, tier (qualified >= 70, review 45-69, ' +
-    'rejected < 45 or a gate: closed, real website, outside the target counties, duplicate), score_breakdown, reject_reason. ' +
+    'duplicate check, Comptroller permit match, Overture Places match (phone, else name within 150 m), Maps signals already on the ' +
+    'row. Writes score, tier (qualified >= 70, review 45-69, rejected < 45 or a gate: closed, real website on Maps or Overture, ' +
+    'outside the target counties, duplicate), score_breakdown, reject_reason; an Overture website also sets website_class. ' +
+    'Waits (scored 0) until overture_places is loaded. Re-score everything by calling it until scored is 0. ' +
     'No browsing: rows with no Maps listing signals yet (signals_at null) are skipped unless force=true; ' +
     'start_signals_backfill fills them. Tile runs call it automatically at the end.',
   inputSchema: {
@@ -427,7 +521,14 @@ export const START_BACKFILL_TOOL = {
     'Each lead is one Maps call against the daily harvest budget. Check progress with signals_backfill_status.',
   inputSchema: {
     type: 'object',
-    properties: { max: { type: 'integer', minimum: 1, maximum: BACKFILL_CAP, description: 'Leads to check (default 100).' } },
+    properties: {
+      max: { type: 'integer', minimum: 1, maximum: BACKFILL_CAP, description: 'Leads to check (default 100).' },
+      city: {
+        type: 'string',
+        description: 'Only leads in this city, or a comma-separated list ("Aubrey" or "Aubrey, Pilot Point"); oldest first. ' +
+          'Default: every city, newest first.',
+      },
+    },
   },
 };
 
@@ -438,32 +539,38 @@ export const BACKFILL_STATUS_TOOL = {
 };
 
 const backfillSummary = (b) => ({
-  run_id: b.id, running: b.running, max: b.max, candidates: b.candidates, checked: b.checked, filled: b.filled, errors: b.errors,
+  run_id: b.id, running: b.running, max: b.max, cities: b.cities.length ? b.cities : 'all', candidates: b.candidates, checked: b.checked, filled: b.filled, errors: b.errors,
   scored: b.scored, waiting_for: b.waitingFor, stop_reason: b.stopReason, elapsed_s: Math.round(((b.finished ?? Date.now()) - b.started) / 1000),
 });
 
 export function startBackfill(args) {
   const max = Number(args?.max ?? 100);
   if (!Number.isInteger(max) || max < 1 || max > BACKFILL_CAP) return fail(`max must be an integer 1-${BACKFILL_CAP}`);
+  if (args?.city !== undefined && typeof args.city !== 'string') return fail('city must be a string');
+  const cities = [...new Set(String(args?.city ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean))];
+  if (cities.length > 50 || cities.some((c) => c.length > 60)) return fail('city: at most 50 names of up to 60 characters');
   if (backfill?.running) return fail(`a backfill is already going (${backfill.id}); check signals_backfill_status`);
   fs.mkdirSync(BACKFILL_DIR, { recursive: true });
   const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-backfill-${max}`;
   const file = path.join(BACKFILL_DIR, `${id}.log`);
   const b = {
-    id, max, file, started: Date.now(), running: true, candidates: null, checked: 0, filled: 0, errors: 0, scored: 0,
+    id, max, cities, file, started: Date.now(), running: true, candidates: null, checked: 0, filled: 0, errors: 0, scored: 0,
     waitingFor: null, stopReason: null,
     log: (...a) => fs.appendFileSync(file, `${new Date().toISOString().slice(11, 19)} ${a.join(' ')}\n`),
   };
   backfill = b;
   runBackfill(b).catch((err) => { b.stopReason = `error: ${String(err?.message ?? err).slice(0, 300)}`; b.log(b.stopReason); })
     .finally(() => { b.running = false; b.finished = Date.now(); b.log('done', JSON.stringify(backfillSummary(b))); });
-  return text({ started: true, run_id: id, max, expected_minutes: Math.ceil((max * 35) / 60) });
+  return text({ started: true, run_id: id, max, cities: cities.length ? cities : 'all', expected_minutes: Math.ceil((max * 35) / 60) });
 }
 
 async function runBackfill(b) {
-  const rows = await sql(`select source_id, google_maps_url from ${TABLE} where ${NEEDS_SIGNALS} order by first_seen desc limit ${b.max}`);
+  // city is "Aubrey" or "Aubrey, TX": compare the part before the comma.
+  const inCities = b.cities.length ? `and lower(trim(split_part(city, ',', 1))) = any(array[${b.cities.map(lit).join(',')}]::text[])` : '';
+  const rows = await sql(`select source_id, google_maps_url from ${TABLE} where ${NEEDS_SIGNALS} ${inCities}
+    order by first_seen ${b.cities.length ? 'asc' : 'desc'} nulls last limit ${b.max}`);
   b.candidates = rows.length;
-  b.log(`backfill ${b.id}: ${rows.length} leads with no listing signals`);
+  b.log(`backfill ${b.id}: ${rows.length} leads with no listing signals${b.cities.length ? ` in ${b.cities.join(', ')}` : ''}`);
   const stop = makeStopper();
   let batch = [];
   const rescore = async () => {
@@ -497,18 +604,40 @@ export function backfillStatus() {
   return text({ ...backfillSummary(backfill), last_lines: lines.slice(-8) });
 }
 
-/** Called once by index.js: nightly tx_permits refresh (and once now if the table is missing). */
+// ---- Overture load (separate process: DuckDB and ~400k rows stay out of the gateway) ----------------
+const OVERTURE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'overture-load.mjs');
+const OVERTURE_DIR = path.join(DATA_DIR, 'overture');
+const OVERTURE_CRON = process.env.OVERTURE_CRON || '0 4 3 * *'; // America/Chicago, 3rd of the month (Overture releases monthly)
+let overtureChild = null;
+let overtureAutoAt = 0;
+/** Spawn scripts/overture-load.mjs unless one is running. auto: started because nothing is loaded; at most once an hour. */
+function startOvertureLoad(log = () => {}, auto = true) {
+  if (overtureChild || (auto && Date.now() - overtureAutoAt < 3600000)) return;
+  if (auto) overtureAutoAt = Date.now();
+  fs.mkdirSync(OVERTURE_DIR, { recursive: true });
+  const file = path.join(OVERTURE_DIR, `${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
+  const fd = fs.openSync(file, 'a');
+  overtureChild = spawn(process.execPath, [OVERTURE_SCRIPT], { cwd: path.dirname(path.dirname(OVERTURE_SCRIPT)), env: process.env, stdio: ['ignore', fd, fd] });
+  overtureChild.on('exit', (code) => { overtureChild = null; fs.closeSync(fd); if (code) log(`overture load exited ${code}; see ${file}`); });
+  overtureChild.on('error', (err) => { overtureChild = null; fs.appendFileSync(file, `spawn error: ${err.message}\n`); });
+  log(`overture load started: ${file}`);
+}
+
+/** Called once by index.js: nightly tx_permits refresh (and once now if the table is missing), monthly Overture load. */
 export function initScorer({ supabase, log }) {
   if (!supabase) return;
   const refresh = () => refreshPermits(log).catch((err) => log.warn(`[scorer] tx_permits refresh failed: ${err?.message ?? err}`));
   if (!fs.existsSync(PERMITS_DB)) refresh();
-  let fields;
-  try { fields = parseCron(PERMITS_CRON); } catch (err) { log.warn(`[scorer] PERMITS_CRON ignored: ${err.message}`); return; }
+  const crons = [];
+  for (const [name, expr, run] of [['PERMITS_CRON', PERMITS_CRON, refresh],
+    ['OVERTURE_CRON', OVERTURE_CRON, () => startOvertureLoad((m) => log.info(`[scorer] ${m}`), false)]]) {
+    try { crons.push([parseCron(expr), run]); } catch (err) { log.warn(`[scorer] ${name} ignored: ${err.message}`); }
+  }
   let lastMinute = -1;
   setInterval(() => {
     const minute = Math.floor(Date.now() / 60000);
-    if (minute === lastMinute || !cronMatches(fields, new Date())) return;
+    if (minute === lastMinute) return;
     lastMinute = minute;
-    refresh();
+    for (const [fields, run] of crons) if (cronMatches(fields, new Date())) run();
   }, 20 * 1000).unref();
 }
