@@ -395,16 +395,16 @@ const COLS = ['source_id', 'name', 'city', 'address', 'zip', 'phone', 'phone_e16
  * Score up to `limit` rows that are unscored (or scored by another version). Rows without listing signals are
  * skipped unless `force`, and a row with an address waits for its geocode, so nothing is scored (or routed) on
  * half the data. `ids`: only these source_ids (the backfill re-scores what it just filled).
- * Nothing is scored until overture_places is loaded (v2 without it would never be redone).
+ * Overture never blocks: while overture_places is missing, empty or reloading, rows are scored without it as v1
+ * (only unscored rows, so v2 scores are never downgraded); once it is ready, v1 rows are re-scored as v2.
  */
 export async function scoreLeads({ limit = 200, force = false, ids = null } = {}, log = () => {}) {
   const ov = await overtureState();
-  if (ov?.status !== 'ready') {
-    if (!ov) startOvertureLoad(log);
-    return { scored: 0, waiting_for: 'overture_places', overture: ov?.status ?? 'not loaded (load started)' };
-  }
+  if (!ov) startOvertureLoad(log);
+  const ready = ov?.status === 'ready';
+  const version = ready ? SCORER_VERSION : 'v1';
   let rows = await sql(`select ${COLS.join(',')} from ${TABLE} where city is not null
-    and (scored_at is null or scorer_version is distinct from ${lit(SCORER_VERSION)})
+    and (scored_at is null ${ready ? `or scorer_version is distinct from ${lit(SCORER_VERSION)}` : ''})
     ${force ? '' : 'and signals_at is not null'}
     ${ids ? `and source_id = any(array[${ids.map(lit).join(',')}]::text[])` : ''}
     order by first_seen desc limit ${limit}`);
@@ -440,7 +440,7 @@ export async function scoreLeads({ limit = 200, force = false, ids = null } = {}
   }
 
   // 3. Overture match, Comptroller permits + target area, then the score.
-  const overture = rows.length ? await matchOverture(rows) : new Map();
+  const overture = ready && rows.length ? await matchOverture(rows) : new Map();
   const db = openPermits();
   const vals = [];
   const tiers = { qualified: 0, review: 0, rejected: 0 };
@@ -454,6 +454,7 @@ export async function scoreLeads({ limit = 200, force = false, ids = null } = {}
       overture: overture.get(r.source_id) ?? null };
     const s = scoreLead(r, sig);
     if (!db) s.breakdown.comptroller.value = 'tx_permits not loaded yet';
+    if (!ready) s.breakdown.overture.value = 'overture_places not loaded yet';
     // An Overture website the Maps listing did not show: the row now has a website too.
     const ovSite = Boolean(sig.overture?.website) && r.website_class !== 'website';
     if (ovSite && s.reject_reason === 'has_website') {
@@ -466,10 +467,11 @@ export async function scoreLeads({ limit = 200, force = false, ids = null } = {}
   }
   for (let i = 0; i < vals.length; i += 100) {
     await sql(`update ${TABLE} t set score=v.score::int, tier=v.tier, score_breakdown=v.b::jsonb, reject_reason=v.rr, duplicate_of=v.dup,
-      website_class=coalesce(v.wc, t.website_class), scored_at=now(), scorer_version=${lit(SCORER_VERSION)}
+      website_class=coalesce(v.wc, t.website_class), scored_at=now(), scorer_version=${lit(version)}
       from (values ${vals.slice(i, i + 100).join(',')}) as v(id, score, tier, b, rr, dup, wc) where t.source_id = v.id`);
   }
-  return { scored: rows.length, ...tiers, overture: { release: ov.release, ...ovCount }, geocoded: toGeo.filter((r) => r.geo_match).length,
+  return { scored: rows.length, scorer_version: version, ...tiers,
+    overture: ready ? { release: ov.release, ...ovCount } : `${ov?.status ?? 'not loaded'}: scored without it (v1), re-scored as v2 once loaded`, geocoded: toGeo.filter((r) => r.geo_match).length,
     waiting_for_geocode: waiting, geocode_error: geoError, permits_loaded: Boolean(db) };
 }
 
@@ -481,7 +483,8 @@ export const SCORE_LEADS_TOOL = {
     'duplicate check, Comptroller permit match, Overture Places match (phone, else name within 150 m), Maps signals already on the ' +
     'row. Writes score, tier (qualified >= 70, review 45-69, rejected < 45 or a gate: closed, real website on Maps or Overture, ' +
     'outside the target counties, duplicate), score_breakdown, reject_reason; an Overture website also sets website_class. ' +
-    'Waits (scored 0) until overture_places is loaded. Re-score everything by calling it until scored is 0. ' +
+    'While overture_places is not loaded, rows are scored without it (scorer_version v1) and re-scored with it once it is. ' +
+    'Re-score everything by calling it until scored is 0. ' +
     'No browsing: rows with no Maps listing signals yet (signals_at null) are skipped unless force=true; ' +
     'start_signals_backfill fills them. Tile runs call it automatically at the end.',
   inputSchema: {

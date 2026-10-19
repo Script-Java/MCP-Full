@@ -264,10 +264,19 @@ assert.match(scoredUpd, /website_class=coalesce\(v\.wc, t\.website_class\)/);
 assert.match(scoredUpd, /\('x','0','rejected',.*'has_website',NULL,'website'\)/);
 assert.match(scoredUpd, /"overture":\{"value":\{"id":"p2","name":"YELLOW ROSE PLUMBING LLC","matched_by":"name_150m","confidence":0.8,"socials":\["https:\/\/facebook.com\/yr"\],"website":null\},"points":8\}/);
 assert.match(scoredUpd, /\('z',.*"overture":\{"value":null,"points":0\}/);
-// Nothing is scored while the table is being refilled.
+assert.match(scoredUpd, /scorer_version='v2'/);
+// While the table is refilled (or missing): only unscored rows, no Overture lookup, scored as v1.
 meta = [{ release: '2026-10-21.0', status: 'loading', age_s: 60 }];
-sr = await S.scoreLeads({ limit: 5 });
-assert.deepEqual(sr, { scored: 0, waiting_for: 'overture_places', overture: 'loading' });
+queries.length = 0;
+sr = await S.scoreLeads({ limit: 5, ids: ['x', 'y', 'z'] });
+assert.equal(sr.scorer_version, 'v1');
+assert.match(sr.overture, /^loading: scored without it/);
+assert.ok(sr.scored > 0);
+assert.doesNotMatch(queries.find((q) => /^select source_id,name,/.test(q)), /scorer_version is distinct/);
+assert.ok(!queries.some((q) => /from overture_places|join overture_places/.test(q)));
+const v1Upd = queries.find((q) => /^update .* set score=v\.score::int/s.test(q));
+assert.match(v1Upd, /scorer_version='v1'/);
+assert.match(v1Upd, /"overture":\{"value":"overture_places not loaded yet","points":0\}/);
 meta = [{ release: '2026-09-23.1', status: 'ready', age_s: 100 }];
 
 await T.stopTileRuns('test over');

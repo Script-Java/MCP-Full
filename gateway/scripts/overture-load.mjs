@@ -3,7 +3,7 @@
 // MCP_GATEWAY_TOKEN are set; the gateway starts it monthly (OVERTURE_CRON) and when no release is loaded yet:
 //   node scripts/overture-load.mjs [--dry-run] [--force]
 // --dry-run: download and count, write nothing (no gateway needed). --force: reload a release that is already loaded.
-// While it refills the table, overture_meta.status is 'loading' and score_leads waits.
+// While it refills the table, overture_meta.status is 'loading' and score_leads scores without Overture (v1).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,13 +41,17 @@ if (!DRY) {
     requestInit: { headers: { Authorization: `Bearer ${process.env.MCP_GATEWAY_TOKEN}`, 'X-MCP-Async': 'off' } },
   }));
   sql = async (query) => {
-    const r = await c.callTool({ name: 'supabase__execute_sql', arguments: { query } }, undefined, { timeout: 200000 });
-    const t = r.content?.[0]?.text ?? '';
-    let body = t;
-    try { body = JSON.parse(t).result ?? t; } catch {}
-    const m = body.match(/<untrusted-data-([\w-]+)>\n([\s\S]*?)\n<\/untrusted-data-\1>/);
-    if (!m) throw new Error(`sql failed: ${body.slice(0, 300)}`);
-    return JSON.parse(m[2]);
+    // The Supabase Management API throttles execute_sql (~800 inserts per load): back off and retry.
+    for (let attempt = 0; ; attempt++) {
+      const r = await c.callTool({ name: 'supabase__execute_sql', arguments: { query } }, undefined, { timeout: 200000 });
+      const t = r.content?.[0]?.text ?? '';
+      let body = t;
+      try { body = JSON.parse(t).result ?? t; } catch {}
+      const m = body.match(/<untrusted-data-([\w-]+)>\n([\s\S]*?)\n<\/untrusted-data-\1>/);
+      if (m) return JSON.parse(m[2]);
+      if (!/Too Many Requests|ThrottlerException|429/.test(t) || attempt >= 8) throw new Error(`sql failed: ${body.slice(0, 300)}`);
+      await new Promise((res) => setTimeout(res, Math.min(60000, 2000 * 2 ** attempt)));
+    }
   };
 }
 const lit = (v) => (v === null || v === undefined ? 'NULL' : `'${String(v).replace(/\0/g, '').replace(/'/g, "''")}'`);
@@ -111,20 +115,27 @@ const flush = async () => {
   }
   batch = [];
 };
-for await (const line of readline.createInterface({ input: fs.createReadStream(tmp) })) {
-  if (!line.trim()) continue;
-  const r = JSON.parse(line);
-  r.phones_e164 = [...new Set((r.phones ?? []).map(e164).filter(Boolean))];
-  n++; if (r.websites?.length) web++; if (r.phones_e164.length) phoned++;
-  sample ??= r;
-  batch.push(r);
-  if (batch.length >= BATCH) {
-    await flush();
-    if (n % 50000 === 0) log(`${n} rows`);
+try {
+  for await (const line of readline.createInterface({ input: fs.createReadStream(tmp) })) {
+    if (!line.trim()) continue;
+    const r = JSON.parse(line);
+    r.phones_e164 = [...new Set((r.phones ?? []).map(e164).filter(Boolean))];
+    n++; if (r.websites?.length) web++; if (r.phones_e164.length) phoned++;
+    sample ??= r;
+    batch.push(r);
+    if (batch.length >= BATCH) {
+      await flush();
+      if (n % 50000 === 0) log(`${n} rows`);
+    }
   }
+  await flush();
+} catch (err) {
+  // Not 'loading' any more, so the gateway retries within the hour instead of waiting 3 h for it to go stale.
+  if (!DRY) await sql('update overture_meta set status = null where id = 1').catch(() => {});
+  throw err;
+} finally {
+  fs.rmSync(tmp, { force: true });
 }
-await flush();
-fs.rmSync(tmp, { force: true });
 
 if (!DRY) {
   const [{ count }] = await sql('select count(*)::int as count from overture_places');
